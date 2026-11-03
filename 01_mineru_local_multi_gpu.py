@@ -11,7 +11,7 @@ No Router / no --api-url. Each GPU consumes disjoint batches.
 nohup python -u 01_mineru_local_multi_gpu.py > /mnt/sdc/mineru_3gpu_10000.log 2>&1 &
 tail -f /mnt/sdc/mineru_3gpu_10000.log
 """
-__version__ = '1.3.0'
+__version__ = '1.3.1'
 
 import argparse
 import json
@@ -114,8 +114,10 @@ def count_md_stems(results_dir: Path) -> int:
 
 
 def run_batch(gpu, number, files, src_root, output, args, log_dir, live, live_lock):
-    # Temp is unique per GPU/batch, never shared by two mineru commands.
-    with tempfile.TemporaryDirectory(prefix=f'_mineru_gpu{gpu}_', dir=output) as temp:
+    # Temp on local disk (not NAS output): unique per GPU/batch.
+    temp_root = Path(args.temp_dir)
+    temp_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f'_mineru_gpu{gpu}_', dir=str(temp_root)) as temp:
         tmp = Path(temp)
         staged = tmp / 'input'
         results = tmp / 'results'
@@ -307,6 +309,10 @@ def main():
     ap.add_argument('--file-list', type=Path, default=None,
                     help='索引/分片 TSV（或每行一个 rel_path）；指定后只处理列表内 PDF')
     ap.add_argument('--output', type=Path, default=DEFAULT_OUTPUT)
+    ap.add_argument(
+        '--temp-dir', type=Path, default=None,
+        help='本地临时目录（默认 /tmp/mineru_local_batches）；MinerU 中间结果写这里，勿指向 NAS',
+    )
     ap.add_argument('--gpus', default='0,1,2', help='GPU IDs, e.g. 0,1 or 0,1,2')
     ap.add_argument('--batch-size', type=int, default=1000)
     ap.add_argument('--limit', type=int, default=0)
@@ -326,11 +332,29 @@ def main():
         ap.error('--gpus should be unique nonnegative IDs separated by commas')
 
     log(f'[info] mineru_local_multi_gpu.py v{__version__}')
+    if args.temp_dir is None:
+        args.temp_dir = Path(tempfile.gettempdir()) / 'mineru_local_batches'
+    args.temp_dir = args.temp_dir.resolve()
+    try:
+        args.temp_dir.mkdir(parents=True, exist_ok=True)
+        probe = args.temp_dir / f'.write_probe_{os.getpid()}'
+        probe.write_text('ok', encoding='utf-8')
+        probe.unlink(missing_ok=True)
+    except OSError as exc:
+        raise SystemExit(f'temp-dir not writable: {args.temp_dir} ({exc})') from exc
+    log(f'[info] temp-dir={args.temp_dir}')
+
     src_root, all_pdfs = collect_pdfs(args)
     output = args.output.resolve()
-    output.mkdir(parents=True, exist_ok=True)
-    log_dir = output / '_logs'
-    log_dir.mkdir(exist_ok=True)
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+        log_dir = output / '_logs'
+        log_dir.mkdir(exist_ok=True)
+    except OSError as exc:
+        raise SystemExit(
+            f'output not writable (NAS 权限/IO?): {output} ({exc}); '
+            f'可先写到本地盘再同步'
+        ) from exc
 
     log('[info] scanning output for .success (one pass)')
     t0 = time.monotonic()
@@ -363,6 +387,7 @@ def main():
     stats = {'ok': 0, 'failed': 0, 'batches': 0}
     started = time.monotonic()
     stop_heartbeat = threading.Event()
+    stop_workers = threading.Event()
     failed_path = log_dir / 'failed_local.txt'
 
     def heartbeat():
@@ -401,7 +426,7 @@ def main():
 
     # Do not destroy older failure logs, append per run.
     def worker(gpu):
-        while True:
+        while not stop_workers.is_set():
             try:
                 index, files = batches.get_nowait()
             except queue.Empty:
@@ -410,17 +435,30 @@ def main():
                 ok, failed, rc, seconds, logfile = run_batch(
                     gpu, index, files, src_root, output, args, log_dir, live, live_lock)
             except Exception as exc:
-                ok, failed, rc, seconds, logfile = 0, files, -1, 0.0, 'internal error'
-                with (log_dir / 'scheduler_errors.txt').open('a', encoding='utf-8') as err:
-                    err.write(f'GPU {gpu} batch {index}: {exc!r}\n')
+                ok, failed, rc, seconds = 0, files, -1, 0.0
+                logfile = f'ERROR {exc!r}'
+                log(f'[GPU {gpu}] ERROR batch={index:05d} {exc!r}')
+                try:
+                    with (log_dir / 'scheduler_errors.txt').open('a', encoding='utf-8') as err:
+                        err.write(f'GPU {gpu} batch {index}: {exc!r}\n')
+                except OSError as log_exc:
+                    log(f'[warn] cannot write scheduler_errors: {log_exc!r}')
+                # NAS EIO / ENOSPC：停止继续烧完所有 batch
+                if isinstance(exc, OSError) and getattr(exc, 'errno', None) in (5, 28):
+                    if not stop_workers.is_set():
+                        stop_workers.set()
+                        log(f'[fatal] filesystem error ({exc!r}); stop remaining batches')
             with lock:
                 stats['ok'] += ok
                 stats['failed'] += len(failed)
                 stats['batches'] += 1
                 if failed:
-                    with failed_path.open('a', encoding='utf-8') as out:
-                        for p in failed:
-                            out.write(f'{datetime.now().isoformat()}\tGPU{gpu}\t{p}\n')
+                    try:
+                        with failed_path.open('a', encoding='utf-8') as out:
+                            for p in failed:
+                                out.write(f'{datetime.now().isoformat()}\tGPU{gpu}\t{p}\n')
+                    except OSError as log_exc:
+                        log(f'[warn] cannot write failed_local: {log_exc!r}')
                 elapsed = max(1, time.monotonic() - started)
                 done_like = skipped + stats['ok']
                 log(

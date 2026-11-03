@@ -12,7 +12,7 @@
 
 ## 第一步：PDF 转 Markdown
 
-`01_mineru_local_multi_gpu.py`（v1.3.0）把目录内 PDF 递归转为 Markdown。每张 GPU 独立跑本地 MinerU（无 Router / 无远程 API），支持断点续跑、进度条、**索引分片多机并行**。控制台日志带时间戳；索引模式默认不做逐文件 NAS `stat`，启动更快。
+`01_mineru_local_multi_gpu.py`（v1.3.1）把目录内 PDF 递归转为 Markdown。每张 GPU 独立跑本地 MinerU（无 Router / 无远程 API），支持断点续跑、进度条、**索引分片多机并行**。控制台日志带时间戳；索引模式默认不做逐文件 NAS `stat`，启动更快。中间临时目录默认在本地盘（`--temp-dir`，勿用 NAS）。
 
 索引工具：`build_pdf_index.py`（扫 PDF → 全量索引 + N 分片；供 MinerU / 后续预训练共用）。
 
@@ -126,6 +126,7 @@ pgrep -af '01_mineru_local_multi_gpu|mineru -p'
 | `--input` | 见脚本 | PDF 根 / 索引 `rel_path` 解析根 |
 | `--file-list` | 无 | 索引或分片 TSV；指定后只处理列表内文件 |
 | `--output` | 见脚本 | Markdown 输出根目录 |
+| `--temp-dir` | `/tmp/mineru_local_batches` | 本地临时目录（MinerU 中间结果）；勿指向 NAS |
 | `--gpus` | `0,1,2` | GPU ID，逗号分隔、不可重复 |
 | `--batch-size` | `1000` | 每批 PDF 数 |
 | `--limit` | `0` | `>0` 时只处理前 N 个；`0` 表示全部 |
@@ -152,6 +153,7 @@ tail -f {output}/_logs/gpu*_batch*.log
 2. 不要设置 `MINERU_API_URL`；脚本会清除该变量，强制本地引擎。
 3. 请固定 `mineru==3.4.5`，勿随意升到 4.x（接口/行为可能不兼容本脚本）。
 4. 多机并行时各分片 `--file-list` 必须互斥；索引可共享复用，`--input` 为本机论文根目录（能解析索引里的 `rel_path` 即可）。
+5. `--temp-dir` 必须可写本地盘。把临时目录放在 NAS 上容易出现 `OSError: Input/output error`，导致整批失败。
 
 ## 第二步：Markdown 生成预训练数据
 
