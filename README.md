@@ -4,14 +4,17 @@
 
 | 顺序 | 脚本 | 作用 |
 | --- | --- | --- |
-| 1 | `01_mineru_local_multi_gpu.py` | PDF 递归转为 Markdown |
+| 0 | `build_pdf_index.py` | 扫 PDF → 全量索引 + N 分片（多机分配） |
+| 1 | `01_mineru_local_multi_gpu.py` | PDF 递归转为 Markdown（可按索引分片） |
 | 2 | `02_generate_dataset.py` | Markdown 整理为 JSON，再汇总为 JSONL |
 
 第一步的 `--output` 目录，就是第二步的 `--input-dir`。两个脚本使用不同的 conda 环境。
 
 ## 第一步：PDF 转 Markdown
 
-`01_mineru_local_multi_gpu.py`（v1.1.0）把目录内 PDF 递归转为 Markdown。每张 GPU 独立跑本地 MinerU（无 Router / 无远程 API），支持断点续跑与进度条。
+`01_mineru_local_multi_gpu.py`（v1.2.0）把目录内 PDF 递归转为 Markdown。每张 GPU 独立跑本地 MinerU（无 Router / 无远程 API），支持断点续跑、进度条、**索引分片多机并行**。
+
+索引工具：`build_pdf_index.py`（扫 PDF → 全量索引 + N 分片；供 MinerU / 后续预训练共用）。
 
 本机对齐版本：`mineru==3.4.5`（conda 环境约 8.4G；参考依赖 `torch==2.11.0` / `vllm==0.20.2`）。
 
@@ -40,9 +43,42 @@ mineru-models-download
 
 请固定 `mineru==3.4.5`。不要设置 `MINERU_API_URL`；脚本会清除该变量，强制本地引擎。
 
-### 用法
+### 索引分片（推荐：多机 / 百万级）
 
-在仓库根目录、`mineru` 环境中执行：
+在仓库根目录执行：
+
+```bash
+# 扫 PDF → 自动建输出目录 → all_pdfs.tsv + shard_00/01/02.tsv
+python build_pdf_index.py \
+  --input /path/to/pdf_root \
+  --output /path/to/pdf_index \
+  --shards 3
+```
+
+生成：`all_pdfs.tsv`、`shard_00.tsv`…`shard_02.tsv`、`shards_manifest.tsv`。  
+索引列：`rel_path bytes mtime_ns batch lang doc_id`（相对建索引时的论文根目录）。
+
+**索引只需在一台机器上建好**，拷到共享盘或各机复用即可。  
+各机跑任务时：`--input` 填**本机上的论文根目录**（同一套数据，挂载路径可以不同），`--file-list` 指向分到的那份 `shard_XX.tsv`。
+
+```bash
+# 机0 / 机1 / 机2：只改 shard_00 → shard_01 → shard_02
+nohup python -u 01_mineru_local_multi_gpu.py \
+  --input /path/to/pdf_root \
+  --file-list /path/to/pdf_index/shard_00.tsv \
+  --output /path/to/md_out \
+  --gpus 0,1 \
+  --batch-size 500 \
+  > /path/to/md_out/run_shard00.log 2>&1 &
+
+tail -f /path/to/md_out/run_shard00.log
+```
+
+三机可共用同一 `--output`；各机换自己的 `shard_XX.tsv` 和 `run_shardXX.log` 即可。
+
+### 用法（无索引，单机直接扫目录）
+
+适合小数据或试跑；百万级请用上面的索引分片。在仓库根目录、`mineru` 环境中执行：
 
 ```bash
 # 前台试跑（限制数量）
@@ -81,13 +117,14 @@ pkill -f 'mineru -p'
 pgrep -af '01_mineru_local_multi_gpu|mineru -p'
 ```
 
-已写出 `.success` 的结果会保留，重跑会自动跳过。同名 PDF（忽略大小写）出现在不同子目录时，脚本会直接报错退出。
+已写出 `.success` 的结果会保留，重跑会自动跳过。
 
 ### 参数
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `--input` | 见脚本 | PDF 根目录（递归扫描） |
+| `--input` | 见脚本 | PDF 根 / 索引 `rel_path` 解析根 |
+| `--file-list` | 无 | 索引或分片 TSV；指定后只处理列表内文件 |
 | `--output` | 见脚本 | Markdown 输出根目录 |
 | `--gpus` | `0,1,2` | GPU ID，逗号分隔、不可重复 |
 | `--batch-size` | `1000` | 每批 PDF 数 |
@@ -108,6 +145,13 @@ tail -f {output}/_logs/gpu*_batch*.log
 - 已有 `.success` 且存在非空 `.md` → 跳过（可安全重跑）
 - 日志：`{output}/_logs/gpu{N}_batchXXXXX.log`
 - 失败列表：`{output}/_logs/failed_local.txt`（追加写入）
+
+### 注意
+
+1. **目录扫描模式**：同名 PDF（忽略大小写）在不同子目录会直接报错退出。**索引模式**按 `rel_path` 判重，允许不同目录同文件名。
+2. 不要设置 `MINERU_API_URL`；脚本会清除该变量，强制本地引擎。
+3. 请固定 `mineru==3.4.5`，勿随意升到 4.x（接口/行为可能不兼容本脚本）。
+4. 多机并行时各分片 `--file-list` 必须互斥；索引可共享复用，`--input` 为本机论文根目录（能解析索引里的 `rel_path` 即可）。
 
 ## 第二步：Markdown 生成预训练数据
 

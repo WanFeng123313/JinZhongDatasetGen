@@ -2,10 +2,16 @@
 # -*- coding: utf-8 -*-
 """MinerU 3.4.5: recursive PDF -> Markdown, independent local CLI per GPU.
 No Router / no --api-url. Each GPU consumes disjoint batches.
+
+支持两种输入：
+  1) --input 目录递归扫 PDF（旧行为）
+  2) --input <数据集根> + --file-list <索引/分片.tsv>（多机按索引分配）
+
+索引工具见 build_pdf_index.py。
 nohup python -u 01_mineru_local_multi_gpu.py > /mnt/sdc/mineru_3gpu_10000.log 2>&1 &
 tail -f /mnt/sdc/mineru_3gpu_10000.log
 """
-__version__ = '1.1.0'
+__version__ = '1.2.0'
 
 import argparse
 import json
@@ -19,6 +25,8 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+
+from build_pdf_index import load_pdf_paths, normalize_rel
 
 DEFAULT_INPUT = Path('/mnt/sdc/金钟大模型文献/英文10000样品/英文10000样品/pdf')
 DEFAULT_OUTPUT = Path('/mnt/sdc/jinzhong_MD_10000_eg')
@@ -197,9 +205,55 @@ def run_batch(gpu, number, files, src_root, output, args, log_dir, live, live_lo
         return success, failures, return_code, time.monotonic() - start, log_file
 
 
+def collect_pdfs(args: argparse.Namespace) -> tuple[Path, list[Path]]:
+    """返回 (src_root, pdf_list)。优先 --file-list 索引分片。"""
+    src_root = args.input.resolve()
+    if not src_root.is_dir():
+        raise SystemExit(f'Input directory not found: {src_root}')
+
+    if args.file_list:
+        file_list = args.file_list.resolve()
+        if not file_list.is_file():
+            raise SystemExit(f'file-list not found: {file_list}')
+        all_pdfs, missing = load_pdf_paths(file_list, src_root)
+        if missing:
+            print(f'[warn] missing {len(missing)} paths from index (show up to 5):', flush=True)
+            for m in missing[:5]:
+                print(f'  - {m}', flush=True)
+        # 索引模式下以相对路径判重（允许不同目录同名文件名）
+        seen_rel: dict[str, Path] = {}
+        for pdf in all_pdfs:
+            rel = normalize_rel(str(pdf.relative_to(src_root)))
+            if rel in seen_rel:
+                raise SystemExit(f'Duplicate rel_path in file-list: {rel}')
+            seen_rel[rel] = pdf
+        print(f'[info] file-list={file_list} loaded={len(all_pdfs)} missing={len(missing)}', flush=True)
+    else:
+        all_pdfs = sorted(
+            p for p in src_root.rglob('*')
+            if p.is_file() and p.suffix.lower() == '.pdf'
+        )
+        # 目录扫描模式保持旧行为：同名文件名冲突则退出
+        seen_name: dict[str, Path] = {}
+        for pdf in all_pdfs:
+            key = pdf.name.casefold()
+            if key in seen_name:
+                raise SystemExit(
+                    f'Duplicate filename across dirs: {seen_name[key]} and {pdf}'
+                )
+            seen_name[key] = pdf
+
+    if args.limit:
+        all_pdfs = all_pdfs[:args.limit]
+    return src_root, all_pdfs
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--input', type=Path, default=DEFAULT_INPUT)
+    ap.add_argument('--input', type=Path, default=DEFAULT_INPUT,
+                    help='PDF 根目录；与索引配合时为 rel_path 的解析根（数据集根）')
+    ap.add_argument('--file-list', type=Path, default=None,
+                    help='索引/分片 TSV（或每行一个 rel_path）；指定后只处理列表内 PDF')
     ap.add_argument('--output', type=Path, default=DEFAULT_OUTPUT)
     ap.add_argument('--gpus', default='0,1,2', help='GPU IDs, e.g. 0,1 or 0,1,2')
     ap.add_argument('--batch-size', type=int, default=1000)
@@ -218,23 +272,13 @@ def main():
         assert gpus and len(gpus) == len(set(gpus)) and all(x >= 0 for x in gpus)
     except (AssertionError, ValueError):
         ap.error('--gpus should be unique nonnegative IDs separated by commas')
-    src_root = args.input.resolve()
-    if not src_root.is_dir():
-        ap.error(f'Input directory not found: {src_root}')
+
+    src_root, all_pdfs = collect_pdfs(args)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     log_dir = output / '_logs'
     log_dir.mkdir(exist_ok=True)
-    all_pdfs = sorted(p for p in src_root.rglob('*')
-                      if p.is_file() and p.suffix.lower() == '.pdf')
-    if args.limit:
-        all_pdfs = all_pdfs[:args.limit]
-    seen = {}
-    for pdf in all_pdfs:
-        key = pdf.name.casefold()
-        if key in seen:
-            ap.error(f'Duplicate filename across dirs: {seen[key]} and {pdf}')
-        seen[key] = pdf
+
     pending = [p for p in all_pdfs if not has_completed(destination(p, src_root, output))]
     skipped = len(all_pdfs) - len(pending)
     total = len(all_pdfs)
