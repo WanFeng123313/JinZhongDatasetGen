@@ -17,12 +17,12 @@
 
 示例：
 
-    python generate_dataset.py
-    python generate_dataset.py --limit 20 --concurrency 4
-    python generate_dataset.py --stage merge
-    python generate_dataset.py --read-pdf-pages --match Z2-10105388
-    python generate_dataset.py --input-dir "xxx" --output-dir "xxx"
-    python generate_dataset.py --input-dir "xxx" --output-dir "xxx" --read-pdf-pages
+    python 02_generate_dataset.py
+    python 02_generate_dataset.py --limit 20 --concurrency 4
+    python 02_generate_dataset.py --stage merge
+    python 02_generate_dataset.py --read-pdf-pages --match Z2-10105388
+    python 02_generate_dataset.py --input-dir "xxx" --output-dir "xxx"
+    python 02_generate_dataset.py --input-dir "xxx" --output-dir "xxx" --read-pdf-pages
 """
 
 from pretrain_dataset.cli import main

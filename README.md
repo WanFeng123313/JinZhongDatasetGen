@@ -1,6 +1,117 @@
-# 金钟预训练数据集生成
+# 金钟预训练数据集
 
-把知网论文 Markdown 整理成预训练样本。每篇 Markdown 生成一个 JSON 数组，全部 JSON 再汇总成一个 JSONL。正文按本地标题切分；模型只负责学科分类，以及改写缺标点的段落。表格和公式保持原文。
+流水线分两步。第一步把 PDF 转成 Markdown，第二步把 Markdown 整理成预训练样本。
+
+| 顺序 | 脚本 | 作用 |
+| --- | --- | --- |
+| 1 | `01_mineru_local_multi_gpu.py` | PDF 递归转为 Markdown |
+| 2 | `02_generate_dataset.py` | Markdown 整理为 JSON，再汇总为 JSONL |
+
+第一步的 `--output` 目录，就是第二步的 `--input-dir`。两个脚本使用不同的 conda 环境。
+
+## 第一步：PDF 转 Markdown
+
+`01_mineru_local_multi_gpu.py`（v1.1.0）把目录内 PDF 递归转为 Markdown。每张 GPU 独立跑本地 MinerU（无 Router / 无远程 API），支持断点续跑与进度条。
+
+本机对齐版本：`mineru==3.4.5`（conda 环境约 8.4G；参考依赖 `torch==2.11.0` / `vllm==0.20.2`）。
+
+### 环境
+
+- Python **3.10–3.13**（本机为 **3.12.14**）
+- NVIDIA GPU + CUDA（本机 torch 为 `2.11.0+cu130`）
+- 磁盘：环境约 **9G+**，另加输入 PDF / 输出 Markdown 空间
+
+脚本与 MinerU 共用同一个环境。清华镜像：`-i https://pypi.tuna.tsinghua.edu.cn/simple`
+
+```bash
+conda create -n mineru python=3.12 -y
+conda activate mineru
+pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install uv -i https://pypi.tuna.tsinghua.edu.cn/simple
+uv pip install "mineru[all]==3.4.5" -i https://pypi.tuna.tsinghua.edu.cn/simple
+mineru --version   # 应为 3.4.5
+```
+
+首次使用如需下载模型：
+
+```bash
+mineru-models-download
+```
+
+请固定 `mineru==3.4.5`。不要设置 `MINERU_API_URL`；脚本会清除该变量，强制本地引擎。
+
+### 用法
+
+在仓库根目录、`mineru` 环境中执行：
+
+```bash
+# 前台试跑（限制数量）
+python 01_mineru_local_multi_gpu.py \
+  --input /path/to/pdf_root \
+  --output /path/to/md_out \
+  --gpus 0,1 \
+  --batch-size 100 \
+  --limit 10
+
+# 后台大批量
+nohup python -u 01_mineru_local_multi_gpu.py \
+  --input /path/to/pdf_root \
+  --output /path/to/md_out \
+  --gpus 0,1 \
+  --batch-size 1000 \
+  > /path/to/run.log 2>&1 &
+
+tail -f /path/to/run.log
+```
+
+停止：
+
+```bash
+# 若正在 tail 日志，先 Ctrl+C 退出查看
+
+# 停掉批处理脚本及子进程 mineru
+pkill -f 01_mineru_local_multi_gpu.py
+pkill -f 'mineru -p'
+
+# 或按 nohup 打印的 PID：
+# kill <PID>
+# 几秒后仍在则：kill -9 <PID> && pkill -f 'mineru -p'
+
+# 确认已停（无输出即干净）
+pgrep -af '01_mineru_local_multi_gpu|mineru -p'
+```
+
+已写出 `.success` 的结果会保留，重跑会自动跳过。同名 PDF（忽略大小写）出现在不同子目录时，脚本会直接报错退出。
+
+### 参数
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--input` | 见脚本 | PDF 根目录（递归扫描） |
+| `--output` | 见脚本 | Markdown 输出根目录 |
+| `--gpus` | `0,1,2` | GPU ID，逗号分隔、不可重复 |
+| `--batch-size` | `1000` | 每批 PDF 数 |
+| `--limit` | `0` | `>0` 时只处理前 N 个；`0` 表示全部 |
+| `--backend` | `hybrid-engine` | 传给 `mineru -b` |
+| `--gpu-memory-utilization` | `0.7` | GPU 显存占用比例 `(0,1]` |
+| `--progress-interval` | `30` | 总体进度心跳间隔（秒）；`0` 关闭 |
+
+进度会写入 `run.log`：`[progress]` 总进度条 + ETA，`[GPU n]` batch 内 `task#` / 错误摘要，`[live]` 各卡当前 batch。更细的 MinerU 原文日志：
+
+```bash
+tail -f {output}/_logs/gpu*_batch*.log
+```
+
+### 输出
+
+- 每个 PDF → `{output}/{相对路径}/{stem}/`，内含 `.md` 与 `.success` 标记
+- 已有 `.success` 且存在非空 `.md` → 跳过（可安全重跑）
+- 日志：`{output}/_logs/gpu{N}_batchXXXXX.log`
+- 失败列表：`{output}/_logs/failed_local.txt`（追加写入）
+
+## 第二步：Markdown 生成预训练数据
+
+`02_generate_dataset.py` 把知网论文 Markdown 整理成预训练样本。每篇 Markdown 生成一个 JSON 数组，全部 JSON 再汇总成一个 JSONL。正文按本地标题切分；模型只负责学科分类，以及改写缺标点的段落。表格和公式保持原文。
 
 一条记录的格式：
 
@@ -19,7 +130,7 @@
 
 中文论文的 `language` 为 `中文`，`domain` 和 `subdomain` 用简短中文。英文论文的 `language` 为 `English`，学科名用简短英文。
 
-## 环境
+### 环境
 
 生成脚本使用 Python 3.11 及以上，并安装 OpenAI SDK。本机对应 conda 环境 `openai_env`：
 
@@ -27,14 +138,6 @@
 conda activate openai_env
 pip install openai
 ```
-
-模型服务是 OpenAI 兼容接口，由 vLLM 提供。调用前可用仓库里的 `test_vllm.py` 检查服务是否可用：
-
-```bash
-python test_vllm.py --base-url http://192.168.141.11:8002/v1 --model qwen3.8-27b
-```
-
-脚本会列出服务上的模型名，并要求模型只返回 `{"ok": true}`。`--model` 必须和服务里实际加载的名字一致。
 
 开启 `--read-pdf-pages` 时，还需要系统里的 `pdftoppm`（Poppler）。Ubuntu 上可以安装：
 
@@ -44,45 +147,45 @@ sudo apt-get install poppler-utils
 
 该开关把 PDF 页渲成图片后交给当前对话模型，不需要单独的 OCR 环境。
 
-## 使用
+### 用法
 
-在仓库根目录执行。默认读取 `/mnt/sdc/jinzhong_MD_local_final`，结果写到 `dataset_output/`。目录名里含 `_logs` 的 Markdown 会跳过。
+在仓库根目录、`openai_env` 环境中执行。`--input-dir` 指向第一步的 Markdown 输出。默认读取 `/mnt/sdc/jinzhong_MD_local_final`，结果写到 `dataset_output/`。目录名里含 `_logs` 的 Markdown 会跳过。
 
 ```bash
-python generate_dataset.py
+python 02_generate_dataset.py --input-dir "md目录" --output-dir "输出目录"
 ```
 
 常用例子：
 
 ```bash
 # 先看会切成多少段，不调用模型
-python generate_dataset.py --dry-run --limit 20
+python 02_generate_dataset.py --dry-run --limit 20
 
 # 小批量试跑
-python generate_dataset.py --limit 20 --concurrency 4 --output-dir dataset_output_trial
+python 02_generate_dataset.py --limit 20 --concurrency 4 --output-dir dataset_output_trial
 
 # 只重做某一篇
-python generate_dataset.py --match Z2-10105388 --limit 1 --overwrite --stage generate --output-dir /tmp/jz_one
+python 02_generate_dataset.py --match Z2-10105388 --limit 1 --overwrite --stage generate --output-dir /tmp/jz_one
 
 # 转页稿用页面图重读版面
-python generate_dataset.py --read-pdf-pages --match Z2-10105388 --limit 1 --overwrite --stage generate
+python 02_generate_dataset.py --read-pdf-pages --match Z2-10105388 --limit 1 --overwrite --stage generate
 
 # 已有 JSON 时，只重新汇总 JSONL
-python generate_dataset.py --stage merge --output-dir dataset_output
+python 02_generate_dataset.py --stage merge --output-dir dataset_output
 
 # 本地规则自检，不访问模型
-python generate_dataset.py --self-test
+python 02_generate_dataset.py --self-test
 ```
 
 已生成的 JSON 会跳过，中断后直接再跑即可继续。要覆盖旧结果，加上 `--overwrite`。质量过滤后变成空数组的文件同样会被跳过，需要重做时也要加 `--overwrite`。
 
 跑完后日志给出总用时、并发数，以及平均每篇耗时。平均耗时按成功和失败的篇数计算，跳过的不计入。
 
-## 参数
+### 参数
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--input-dir` | `/mnt/sdc/jinzhong_MD_local_final` | 论文 Markdown 根目录 |
+| `--input-dir` | `/mnt/sdc/jinzhong_MD_local_final` | 论文 Markdown 根目录，即第一步的输出目录 |
 | `--output-dir` | `dataset_output` | JSON、JSONL 和日志的输出目录 |
 | `--base-url` | `http://192.168.141.11:8002/v1` | vLLM 的 OpenAI 兼容地址 |
 | `--model` | `qwen3.8-27b` | 服务中的模型名 |
@@ -103,7 +206,7 @@ python generate_dataset.py --self-test
 | `--dry-run` | 关闭 | 只统计切分，不调用模型 |
 | `--self-test` | 关闭 | 运行本地文本规则自检 |
 
-## 输出
+### 输出
 
 ```text
 dataset_output/
@@ -117,7 +220,7 @@ dataset_output/
 
 输入 Markdown 不超过 20000 篇时，汇总为一个 `--jsonl-name` 指定的文件。超过 20000 篇时，按输入顺序每 20000 篇写成一个文件，文件名在扩展名前加序号，例如 `pretrain_qwen3.8_27b_00001.jsonl`、`pretrain_qwen3.8_27b_00002.jsonl`。最后一份可以少于 20000 篇。某一篇还没有 JSON 时，它仍占一个名额，后面的论文不会因此提前进入上一份文件。
 
-## 处理说明
+### 处理说明
 
 同一文件里出现两篇题录（「文章编号」出现两次，并且有第二个一级标题）时，保留第一篇，去掉后面那篇，再生成 JSON。
 
