@@ -15,7 +15,7 @@
 
 索引列（TAB）：rel_path  bytes  mtime_ns  batch  lang  doc_id
 索引一台建好即可复用；各机 MinerU：
-  python 01_mineru_local_multi_gpu.py \\
+  python mineru_local_multi_gpu.py \\
     --input <本机论文根目录> --file-list <共享>/shard_00.tsv --output ...
 """
 from __future__ import annotations
@@ -129,7 +129,7 @@ def load_pdf_paths(
     progress_every: int = 100_000,
     progress_fn=None,
 ) -> tuple[list[Path], list[str]]:
-    """供 01_mineru_local_multi_gpu 等调用：返回 (PDF 路径, 非法/缺失 rel_path)。
+    """供 mineru_local_multi_gpu 等调用：返回 (PDF 路径, 非法/缺失 rel_path)。
 
     默认不做逐文件 is_file（NAS 上对百万级路径极慢），只做安全路径拼接。
     需要强校验时传 check_exists=True。

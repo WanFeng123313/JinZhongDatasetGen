@@ -12,7 +12,7 @@
 
 ## 第一步：PDF 转 Markdown
 
-`01_mineru_local_multi_gpu.py`（v1.3.1）把目录内 PDF 递归转为 Markdown。每张 GPU 独立跑本地 MinerU（无 Router / 无远程 API），支持断点续跑、进度条、**索引分片多机并行**。控制台日志带时间戳；索引模式默认不做逐文件 NAS `stat`，启动更快。中间临时目录默认在本地盘（`--temp-dir`，勿用 NAS）。
+`01_mineru_local_multi_gpu.py`（v1.3.2）把目录内 PDF 递归转为 Markdown。每张 GPU 独立跑本地 MinerU（无 Router / 无远程 API），支持断点续跑、进度条、**索引分片多机并行**。控制台日志带时间戳；索引模式默认不做逐文件 NAS `stat`，启动更快。中间临时目录默认在本地盘（`--temp-dir`，勿用 NAS）。多机共用 `--output` 时，批处理日志写在 `_logs/<run-id>/`（默认取分片文件名）。
 
 索引工具：`build_pdf_index.py`（扫 PDF → 全量索引 + N 分片；供 MinerU / 后续预训练共用）。
 
@@ -74,7 +74,8 @@ nohup python -u 01_mineru_local_multi_gpu.py \
 tail -f /path/to/md_out/run_shard00.log
 ```
 
-三机可共用同一 `--output`；各机换自己的 `shard_XX.tsv` 和 `run_shardXX.log` 即可。
+三机可共用同一 `--output`；各机换自己的 `shard_XX.tsv` 和 `run_shardXX.log` 即可。  
+批处理日志自动落到 `{output}/_logs/shard_XX/`（由 file-list 文件名决定；也可用 `--run-id` 覆盖）。
 
 ### 用法（无索引，单机直接扫目录）
 
@@ -126,6 +127,7 @@ pgrep -af '01_mineru_local_multi_gpu|mineru -p'
 | `--input` | 见脚本 | PDF 根 / 索引 `rel_path` 解析根 |
 | `--file-list` | 无 | 索引或分片 TSV；指定后只处理列表内文件 |
 | `--output` | 见脚本 | Markdown 输出根目录 |
+| `--run-id` | file-list stem / 主机名 | `_logs/<run-id>/` 子目录；多机隔离日志 |
 | `--temp-dir` | `/tmp/mineru_local_batches` | 本地临时目录（MinerU 中间结果）；勿指向 NAS |
 | `--gpus` | `0,1,2` | GPU ID，逗号分隔、不可重复 |
 | `--batch-size` | `1000` | 每批 PDF 数 |
@@ -137,15 +139,15 @@ pgrep -af '01_mineru_local_multi_gpu|mineru -p'
 进度会写入 `run.log`：`[progress]` 总进度条 + ETA，`[GPU n]` batch 内 `task#` / 错误摘要，`[live]` 各卡当前 batch。更细的 MinerU 原文日志：
 
 ```bash
-tail -f {output}/_logs/gpu*_batch*.log
+tail -f {output}/_logs/<run-id>/gpu*_batch*.log
 ```
 
 ### 输出
 
 - 每个 PDF → `{output}/{相对路径}/{stem}/`，内含 `.md` 与 `.success` 标记
 - 已有 `.success` 且存在非空 `.md` → 跳过（可安全重跑）
-- 日志：`{output}/_logs/gpu{N}_batchXXXXX.log`
-- 失败列表：`{output}/_logs/failed_local.txt`（追加写入）
+- 日志目录：`{output}/_logs/<run-id>/`（默认 `shard_XX` 或主机名）
+- 批日志：`gpu{N}_batchXXXXX.log`；失败列表：`failed_local.txt`（追加写入）
 
 ### 注意
 

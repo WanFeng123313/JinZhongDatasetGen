@@ -8,10 +8,8 @@ No Router / no --api-url. Each GPU consumes disjoint batches.
   2) --input <数据集根> + --file-list <索引/分片.tsv>（多机按索引分配）
 
 索引工具见 build_pdf_index.py。
-nohup python -u 01_mineru_local_multi_gpu.py > /mnt/sdc/mineru_3gpu_10000.log 2>&1 &
-tail -f /mnt/sdc/mineru_3gpu_10000.log
 """
-__version__ = '1.3.1'
+__version__ = '1.3.2'
 
 import argparse
 import json
@@ -19,6 +17,7 @@ import os
 import queue
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -27,6 +26,22 @@ from datetime import datetime
 from pathlib import Path
 
 from build_pdf_index import load_pdf_paths, normalize_rel
+
+_RUN_ID_RE = re.compile(r'[^A-Za-z0-9._-]+')
+
+
+def sanitize_run_id(value: str) -> str:
+    cleaned = _RUN_ID_RE.sub('_', (value or '').strip()).strip('._-')
+    return cleaned or 'default'
+
+
+def resolve_run_id(args: argparse.Namespace) -> str:
+    """日志子目录名：--run-id > file-list 文件名(stem) > 主机名。"""
+    if args.run_id:
+        return sanitize_run_id(args.run_id)
+    if args.file_list is not None:
+        return sanitize_run_id(Path(args.file_list).stem)
+    return sanitize_run_id(socket.gethostname())
 
 DEFAULT_INPUT = Path('/mnt/sdc/金钟大模型文献/英文10000样品/英文10000样品/pdf')
 DEFAULT_OUTPUT = Path('/mnt/sdc/jinzhong_MD_10000_eg')
@@ -310,6 +325,10 @@ def main():
                     help='索引/分片 TSV（或每行一个 rel_path）；指定后只处理列表内 PDF')
     ap.add_argument('--output', type=Path, default=DEFAULT_OUTPUT)
     ap.add_argument(
+        '--run-id', default=None,
+        help='_logs 子目录名；默认用 --file-list 文件名(stem)，否则用主机名；多机共用 output 时互不覆盖',
+    )
+    ap.add_argument(
         '--temp-dir', type=Path, default=None,
         help='本地临时目录（默认 /tmp/mineru_local_batches）；MinerU 中间结果写这里，勿指向 NAS',
     )
@@ -344,17 +363,20 @@ def main():
         raise SystemExit(f'temp-dir not writable: {args.temp_dir} ({exc})') from exc
     log(f'[info] temp-dir={args.temp_dir}')
 
+    run_id = resolve_run_id(args)
     src_root, all_pdfs = collect_pdfs(args)
     output = args.output.resolve()
     try:
         output.mkdir(parents=True, exist_ok=True)
-        log_dir = output / '_logs'
-        log_dir.mkdir(exist_ok=True)
+        # 多机共用 output 时：_logs/<run_id>/ 隔离，避免互相覆盖
+        log_dir = output / '_logs' / run_id
+        log_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise SystemExit(
             f'output not writable (NAS 权限/IO?): {output} ({exc}); '
             f'可先写到本地盘再同步'
         ) from exc
+    log(f'[info] run-id={run_id} log-dir={log_dir}')
 
     log('[info] scanning output for .success (one pass)')
     t0 = time.monotonic()
