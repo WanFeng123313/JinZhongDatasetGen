@@ -121,27 +121,41 @@ def iter_index_rows(path: Path) -> Iterator[dict[str, str]]:
                 yield row
 
 
-def load_pdf_paths(file_list: Path, root: Path) -> tuple[list[Path], list[str]]:
-    """供 01_mineru_local_multi_gpu 等调用：返回 (存在的 PDF, 缺失 rel_path)。"""
+def load_pdf_paths(
+    file_list: Path,
+    root: Path,
+    *,
+    check_exists: bool = False,
+    progress_every: int = 100_000,
+    progress_fn=None,
+) -> tuple[list[Path], list[str]]:
+    """供 01_mineru_local_multi_gpu 等调用：返回 (PDF 路径, 非法/缺失 rel_path)。
+
+    默认不做逐文件 is_file（NAS 上对百万级路径极慢），只做安全路径拼接。
+    需要强校验时传 check_exists=True。
+    """
     root = root.resolve()
     out: list[Path] = []
     missing: list[str] = []
     seen: set[str] = set()
+    n = 0
     for row in iter_index_rows(file_list):
         rel = row["rel_path"]
         if rel in seen:
             continue
         seen.add(rel)
-        pdf = (root / rel).resolve()
-        try:
-            pdf.relative_to(root)
-        except ValueError:
+        parts = Path(normalize_rel(rel)).parts
+        if not parts or any(p == ".." for p in parts):
             missing.append(rel)
             continue
-        if pdf.is_file():
-            out.append(pdf)
-        else:
+        pdf = root.joinpath(*parts)
+        if check_exists and not pdf.is_file():
             missing.append(rel)
+            continue
+        out.append(pdf)
+        n += 1
+        if progress_every and progress_fn and n % progress_every == 0:
+            progress_fn(n)
     return out, missing
 
 

@@ -11,7 +11,7 @@ No Router / no --api-url. Each GPU consumes disjoint batches.
 nohup python -u 01_mineru_local_multi_gpu.py > /mnt/sdc/mineru_3gpu_10000.log 2>&1 &
 tail -f /mnt/sdc/mineru_3gpu_10000.log
 """
-__version__ = '1.2.0'
+__version__ = '1.3.0'
 
 import argparse
 import json
@@ -41,6 +41,11 @@ ERROR_HINT_RE = re.compile(
 )
 
 
+def log(msg: str = '') -> None:
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f'[{ts}] {msg}', flush=True)
+
+
 def has_completed(dst: Path) -> bool:
     if not (dst / '.success').is_file():
         return False
@@ -50,6 +55,27 @@ def has_completed(dst: Path) -> bool:
 def destination(src: Path, root: Path, output: Path) -> Path:
     relative = src.relative_to(root)
     return output / relative.parent / src.stem
+
+
+def dest_key(src: Path, root: Path) -> str:
+    """与 destination() 相对 output 的路径一致，用于快速跳过集合。"""
+    relative = src.relative_to(root)
+    return normalize_rel(str(relative.parent / src.stem))
+
+
+def completed_dest_keys(output: Path) -> set[str]:
+    """扫一遍输出目录中的 .success，避免对每个 PDF 单独 stat。"""
+    keys: set[str] = set()
+    if not output.is_dir():
+        return keys
+    for marker in output.rglob('.success'):
+        if not marker.is_file():
+            continue
+        try:
+            keys.add(normalize_rel(str(marker.parent.relative_to(output))))
+        except ValueError:
+            continue
+    return keys
 
 
 def fmt_duration(seconds: float) -> str:
@@ -95,8 +121,15 @@ def run_batch(gpu, number, files, src_root, output, args, log_dir, live, live_lo
         results = tmp / 'results'
         staged.mkdir()
         results.mkdir()
+        missing_now: list[Path] = []
+        present: list[Path] = []
         for pdf in files:
-            (staged / pdf.name).symlink_to(pdf.resolve())
+            # 索引模式下启动时不做 is_file；缺失文件在此失败并记入 failures
+            if pdf.is_file():
+                (staged / pdf.name).symlink_to(pdf)
+                present.append(pdf)
+            else:
+                missing_now.append(pdf)
         cmd = ['mineru', '-p', str(staged), '-o', str(results),
                '-b', args.backend,
                '--gpu-memory-utilization', str(args.gpu_memory_utilization)]
@@ -117,57 +150,64 @@ def run_batch(gpu, number, files, src_root, output, args, log_dir, live, live_lo
                 'started': start,
             }
 
-        print(
+        log(
             f'[GPU {gpu}] START batch={number:05d} files={len(files)} '
-            f'log={log_file}',
-            flush=True,
+            f'present={len(present)} missing={len(missing_now)} log={log_file}'
         )
 
-        return_code = -1
+        return_code = 0
         try:
-            with log_file.open('w', encoding='utf-8') as log:
-                log.write(f'GPU={gpu} count={len(files)} command={cmd}\n')
-                log.flush()
-                proc = subprocess.Popen(
-                    cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1,
+            with log_file.open('w', encoding='utf-8') as lf:
+                lf.write(
+                    f'GPU={gpu} count={len(files)} present={len(present)} '
+                    f'missing={len(missing_now)} command={cmd}\n'
                 )
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    log.write(line)
-                    log.flush()
-                    stripped = line.rstrip()
-                    task_m = TASK_RE.search(stripped)
-                    interesting = bool(
-                        task_m or SUBMIT_RE.search(stripped) or ERROR_HINT_RE.search(stripped)
+                lf.flush()
+                if present:
+                    proc = subprocess.Popen(
+                        cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, bufsize=1,
                     )
-                    with live_lock:
-                        state = live.get(gpu, {})
-                        if task_m:
-                            state['task_seen'] = max(
-                                int(state.get('task_seen', 0)), int(task_m.group(1)),
-                            )
-                        state['last_line'] = stripped[-160:]
-                        state['md_ready'] = count_md_stems(results)
-                        live[gpu] = state
-                    if interesting:
-                        seen = live.get(gpu, {}).get('task_seen', 0)
-                        md_n = live.get(gpu, {}).get('md_ready', 0)
-                        print(
-                            f'[GPU {gpu}] batch={number:05d} '
-                            f'{progress_bar(max(seen, md_n), len(files), width=20)} '
-                            f'| {stripped[-100:]}',
-                            flush=True,
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        lf.write(line)
+                        lf.flush()
+                        stripped = line.rstrip()
+                        task_m = TASK_RE.search(stripped)
+                        interesting = bool(
+                            task_m or SUBMIT_RE.search(stripped) or ERROR_HINT_RE.search(stripped)
                         )
-                return_code = proc.wait()
+                        with live_lock:
+                            state = live.get(gpu, {})
+                            if task_m:
+                                state['task_seen'] = max(
+                                    int(state.get('task_seen', 0)), int(task_m.group(1)),
+                                )
+                            state['last_line'] = stripped[-160:]
+                            state['md_ready'] = count_md_stems(results)
+                            live[gpu] = state
+                        if interesting:
+                            seen = live.get(gpu, {}).get('task_seen', 0)
+                            md_n = live.get(gpu, {}).get('md_ready', 0)
+                            log(
+                                f'[GPU {gpu}] batch={number:05d} '
+                                f'{progress_bar(max(seen, md_n), len(files), width=20)} '
+                                f'| {stripped[-100:]}'
+                            )
+                    return_code = proc.wait()
+                else:
+                    lf.write('SKIP mineru: all files missing on disk\n')
         except Exception as exc:
-            with log_file.open('a', encoding='utf-8') as log:
-                log.write(f'EXCEPTION: {exc!r}\n')
+            with log_file.open('a', encoding='utf-8') as lf:
+                lf.write(f'EXCEPTION: {exc!r}\n')
             return_code = -1
 
         success = 0
-        failures = []
+        failures = list(missing_now)
+        missing_set = set(missing_now)
         for pdf in files:
+            if pdf in missing_set:
+                continue
             source_dir = results / pdf.stem
             # MinerU may create additional subdirs beneath the stem directory.
             good = source_dir.is_dir() and any(
@@ -197,8 +237,8 @@ def run_batch(gpu, number, files, src_root, output, args, log_dir, live, live_lo
                 success += 1
             except Exception as exc:
                 failures.append(pdf)
-                with log_file.open('a', encoding='utf-8') as log:
-                    log.write(f'OUTPUT ERROR {pdf}: {exc!r}\n')
+                with log_file.open('a', encoding='utf-8') as lf:
+                    lf.write(f'OUTPUT ERROR {pdf}: {exc!r}\n')
 
         with live_lock:
             live.pop(gpu, None)
@@ -215,11 +255,19 @@ def collect_pdfs(args: argparse.Namespace) -> tuple[Path, list[Path]]:
         file_list = args.file_list.resolve()
         if not file_list.is_file():
             raise SystemExit(f'file-list not found: {file_list}')
-        all_pdfs, missing = load_pdf_paths(file_list, src_root)
+        log(f'[info] loading file-list (no per-file NAS stat): {file_list}')
+        t0 = time.monotonic()
+        all_pdfs, missing = load_pdf_paths(
+            file_list,
+            src_root,
+            check_exists=False,
+            progress_every=100_000,
+            progress_fn=lambda n: log(f'  ...index rows {n}'),
+        )
         if missing:
-            print(f'[warn] missing {len(missing)} paths from index (show up to 5):', flush=True)
+            log(f'[warn] invalid {len(missing)} paths from index (show up to 5):')
             for m in missing[:5]:
-                print(f'  - {m}', flush=True)
+                log(f'  - {m}')
         # 索引模式下以相对路径判重（允许不同目录同名文件名）
         seen_rel: dict[str, Path] = {}
         for pdf in all_pdfs:
@@ -227,8 +275,12 @@ def collect_pdfs(args: argparse.Namespace) -> tuple[Path, list[Path]]:
             if rel in seen_rel:
                 raise SystemExit(f'Duplicate rel_path in file-list: {rel}')
             seen_rel[rel] = pdf
-        print(f'[info] file-list={file_list} loaded={len(all_pdfs)} missing={len(missing)}', flush=True)
+        log(
+            f'[info] file-list loaded={len(all_pdfs)} invalid={len(missing)} '
+            f'in {fmt_duration(time.monotonic() - t0)}'
+        )
     else:
+        log(f'[info] scanning PDF under {src_root}')
         all_pdfs = sorted(
             p for p in src_root.rglob('*')
             if p.is_file() and p.suffix.lower() == '.pdf'
@@ -273,23 +325,33 @@ def main():
     except (AssertionError, ValueError):
         ap.error('--gpus should be unique nonnegative IDs separated by commas')
 
+    log(f'[info] mineru_local_multi_gpu.py v{__version__}')
     src_root, all_pdfs = collect_pdfs(args)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     log_dir = output / '_logs'
     log_dir.mkdir(exist_ok=True)
 
-    pending = [p for p in all_pdfs if not has_completed(destination(p, src_root, output))]
+    log('[info] scanning output for .success (one pass)')
+    t0 = time.monotonic()
+    done_keys = completed_dest_keys(output)
+    if done_keys:
+        pending = [p for p in all_pdfs if dest_key(p, src_root) not in done_keys]
+    else:
+        pending = list(all_pdfs)
     skipped = len(all_pdfs) - len(pending)
+    log(
+        f'[info] completed markers={len(done_keys)} skipped={skipped} '
+        f'in {fmt_duration(time.monotonic() - t0)}'
+    )
     total = len(all_pdfs)
     n_batches = (len(pending) + args.batch_size - 1) // args.batch_size if pending else 0
-    print(
+    log(
         f'Found: {total}, skipped: {skipped}, pending: {len(pending)}; '
-        f'GPUs: {gpus}; batch-size: {args.batch_size}; batches: {n_batches}',
-        flush=True,
+        f'GPUs: {gpus}; batch-size: {args.batch_size}; batches: {n_batches}'
     )
-    print('IMPORTANT: no --api-url, each GPU runs its own local MinerU engine', flush=True)
-    print(f'[progress] {progress_bar(skipped, total)} (already done)', flush=True)
+    log('IMPORTANT: no --api-url, each GPU runs its own local MinerU engine')
+    log(f'[progress] {progress_bar(skipped, total)} (already done)')
     if not pending:
         return
     batches = queue.Queue()
@@ -309,14 +371,12 @@ def main():
                 ok = stats['ok']
                 failed = stats['failed']
                 finished_batches = stats['batches']
-            in_flight = 0
             parts = []
             with live_lock:
                 for gpu, st in sorted(live.items()):
                     md_n = count_md_stems(Path(st.get('results_dir', '')))
                     task_n = int(st.get('task_seen', 0))
                     cur = max(md_n, task_n)
-                    in_flight += cur
                     elapsed_b = time.monotonic() - float(st.get('started', started))
                     parts.append(
                         f'GPU{gpu} b{st.get("batch", "?")}:'
@@ -330,15 +390,14 @@ def main():
             remain = max(0, len(pending) - ok - failed)
             eta = (remain / (ok / elapsed)) if ok > 0 else float('inf')
             eta_s = fmt_duration(eta) if eta != float('inf') else 'estimating...'
-            print(
+            log(
                 f'[progress] {progress_bar(done_like, total)} '
                 f'ok+skip={done_like} failed={failed} '
                 f'batches={finished_batches}/{n_batches} '
-                f'rate={rate:.1f}/h ETA={eta_s}',
-                flush=True,
+                f'rate={rate:.1f}/h ETA={eta_s}'
             )
             if parts:
-                print('[live] ' + ' | '.join(parts), flush=True)
+                log('[live] ' + ' | '.join(parts))
 
     # Do not destroy older failure logs, append per run.
     def worker(gpu):
@@ -364,13 +423,12 @@ def main():
                             out.write(f'{datetime.now().isoformat()}\tGPU{gpu}\t{p}\n')
                 elapsed = max(1, time.monotonic() - started)
                 done_like = skipped + stats['ok']
-                print(
+                log(
                     f'[GPU {gpu}] DONE  batch={index:05d} '
                     f'{progress_bar(ok, len(files), width=20)} exit={rc} '
                     f'time={fmt_duration(seconds)} overall={stats["ok"] / elapsed * 3600:.1f}/h '
                     f'total {progress_bar(done_like, total, width=20)} '
-                    f'logs={logfile}',
-                    flush=True,
+                    f'logs={logfile}'
                 )
             batches.task_done()
 
@@ -386,11 +444,10 @@ def main():
         th.join()
     stop_heartbeat.set()
     elapsed = max(1, time.monotonic() - started)
-    print(
+    log(
         f'FINISHED {progress_bar(skipped + stats["ok"], total)} '
         f'ok={stats["ok"]}, skipped={skipped}, failed={stats["failed"]}, '
-        f'wall={fmt_duration(elapsed)}, throughput={stats["ok"] / elapsed * 3600:.1f} PDFs/hour',
-        flush=True,
+        f'wall={fmt_duration(elapsed)}, throughput={stats["ok"] / elapsed * 3600:.1f} PDFs/hour'
     )
 
 
