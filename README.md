@@ -12,9 +12,11 @@
 
 ## 第一步：PDF 转 Markdown
 
-`01_mineru_local_multi_gpu.py`（v1.3.2）把目录内 PDF 递归转为 Markdown。每张 GPU 独立跑本地 MinerU（无 Router / 无远程 API），支持断点续跑、进度条、**索引分片多机并行**。控制台日志带时间戳；索引模式默认不做逐文件 NAS `stat`，启动更快。中间临时目录默认在本地盘（`--temp-dir`，勿用 NAS）。多机共用 `--output` 时，批处理日志写在 `_logs/<run-id>/`（默认取分片文件名）。
+`01_mineru_local_multi_gpu.py`（v1.5.0）把目录内 PDF 递归转为 Markdown。每张 GPU 独立跑本地 MinerU（无 Router / 无远程 API），支持断点续跑、进度条、**索引分片多机并行**。控制台日志带时间戳；索引模式默认不做逐文件 NAS `stat`，启动更快。中间临时目录默认在本地盘（`--temp-dir`，勿用 NAS）。多机共用 `--output` 时，批处理日志写在 `_logs/<run-id>/`（默认取分片文件名）。
 
-索引工具：`build_pdf_index.py`（扫 PDF → 全量索引 + N 分片；供 MinerU / 后续预训练共用）。
+**v1.5.0**：`--order small-first` + `--max-bytes`（默认 10MiB）先做小文件、大文件延后（旧 `1103` 分片也适用）；成功后在 `--file-list` TSV 写入 `ocr_status=ok`、`ocr_finished_at`（**同一 shard 只允许一台机器写**）。仍写输出目录 `.success`，启动时可回填 TSV。
+
+索引工具：`build_pdf_index.py`（扫 PDF → 全量索引 + N 分片；可用 `--balance bytes` / `--from-index` 重切）。
 
 本机对齐版本：`mineru==3.4.5`（conda 环境约 8.4G；参考依赖 `torch==2.11.0` / `vllm==0.20.2`）。
 
@@ -48,33 +50,47 @@ mineru-models-download
 在仓库根目录执行：
 
 ```bash
-# 扫 PDF → 自动建输出目录 → all_pdfs.tsv + shard_00/01/02.tsv
+# 扫 PDF → 全量索引 + N 分片（默认 --balance bytes，片内 --shard-order small-first）
 python build_pdf_index.py \
   --input /path/to/pdf_root \
   --output /path/to/pdf_index \
-  --shards 3
+  --shards 5
+
+# 已有 all_pdfs.tsv：不必重扫，按体积重切 + 片内小→大
+python build_pdf_index.py \
+  --from-index /path/to/pdf_index_old/all_pdfs.tsv \
+  --output /path/to/pdf_index_new \
+  --shards 5 \
+  --balance bytes \
+  --shard-order small-first
 ```
 
-生成：`all_pdfs.tsv`、`shard_00.tsv`…`shard_02.tsv`、`shards_manifest.tsv`。  
-索引列：`rel_path bytes mtime_ns batch lang doc_id`（相对建索引时的论文根目录）。
+生成：`all_pdfs.tsv`、`shard_00.tsv`…、`shards_manifest.tsv`。  
+索引列：`rel_path bytes mtime_ns batch lang doc_id`（相对建索引时的论文根目录）。  
+`--balance bytes`（默认）按文件大小贪心均分；`--shard-order small-first`（默认）保证每片 FIFO 先吃小文件。  
+`bytes` 均分时分配算法内部是大文件优先入桶，**若不做片内重排，队首会全是巨本**。
 
 **索引只需在一台机器上建好**，拷到共享盘或各机复用即可。  
 各机跑任务时：`--input` 填**本机上的论文根目录**（同一套数据，挂载路径可以不同），`--file-list` 指向分到的那份 `shard_XX.tsv`。
 
 ```bash
-# 机0 / 机1 / 机2：只改 shard_00 → shard_01 → shard_02
+# 多机：shard_00 …；先停旧进程再换 v1.4.0 参数
 nohup python -u 01_mineru_local_multi_gpu.py \
   --input /path/to/pdf_root \
   --file-list /path/to/pdf_index/shard_00.tsv \
   --output /path/to/md_out \
-  --gpus 0,1 \
-  --batch-size 500 \
+  --gpus 1,2 \
+  --batch-size 200 \
+  --mineru-chunk-size 25 \
+  --max-bytes 10485760 \
+  --order small-first \
+  --gpu-memory-utilization 0.45 \
   > /path/to/md_out/run_shard00.log 2>&1 &
 
 tail -f /path/to/md_out/run_shard00.log
 ```
 
-三机可共用同一 `--output`；各机换自己的 `shard_XX.tsv` 和 `run_shardXX.log` 即可。  
+多机可共用同一 `--output`；各机换自己的 `shard_XX.tsv` 和 `run_shardXX.log` 即可。  
 批处理日志自动落到 `{output}/_logs/shard_XX/`（由 file-list 文件名决定；也可用 `--run-id` 覆盖）。
 
 ### 用法（无索引，单机直接扫目录）
@@ -95,7 +111,9 @@ nohup python -u 01_mineru_local_multi_gpu.py \
   --input /path/to/pdf_root \
   --output /path/to/md_out \
   --gpus 0,1 \
-  --batch-size 1000 \
+  --batch-size 200 \
+  --mineru-chunk-size 25 \
+  --gpu-memory-utilization 0.45 \
   > /path/to/run.log 2>&1 &
 
 tail -f /path/to/run.log
@@ -106,16 +124,17 @@ tail -f /path/to/run.log
 ```bash
 # 若正在 tail 日志，先 Ctrl+C 退出查看
 
-# 停掉批处理脚本及子进程 mineru
+# 停掉批处理脚本及子进程 mineru（含临时 fast_api / EngineCore）
 pkill -f 01_mineru_local_multi_gpu.py
 pkill -f 'mineru -p'
+pkill -f mineru.cli.fast_api
 
 # 或按 nohup 打印的 PID：
 # kill <PID>
 # 几秒后仍在则：kill -9 <PID> && pkill -f 'mineru -p'
 
 # 确认已停（无输出即干净）
-pgrep -af '01_mineru_local_multi_gpu|mineru -p'
+pgrep -af '01_mineru_local_multi_gpu|mineru -p|mineru.cli.fast_api'
 ```
 
 已写出 `.success` 的结果会保留，重跑会自动跳过。
@@ -129,11 +148,15 @@ pgrep -af '01_mineru_local_multi_gpu|mineru -p'
 | `--output` | 见脚本 | Markdown 输出根目录 |
 | `--run-id` | file-list stem / 主机名 | `_logs/<run-id>/` 子目录；多机隔离日志 |
 | `--temp-dir` | `/tmp/mineru_local_batches` | 本地临时目录（MinerU 中间结果）；勿指向 NAS |
-| `--gpus` | `0,1,2` | GPU ID，逗号分隔、不可重复 |
-| `--batch-size` | `1000` | 每批 PDF 数 |
+| `--gpus` | `1,2` | GPU ID，逗号分隔、不可重复 |
+| `--batch-size` | `200` | 调度/记账粒度 |
+| `--mineru-chunk-size` | `25` | 单次 mineru CLI 篇数；隔离 EngineCore 挂掉连坐 |
+| `--max-bytes` | `10485760` | 大于该体积延后到队尾；`0` 关闭 |
+| `--order` | `small-first` | `as-is` / `small-first` / `large-first` |
+| （file-list 回写） | — | 成功后写 `ocr_status=ok`、`ocr_finished_at`；每批 flush |
 | `--limit` | `0` | `>0` 时只处理前 N 个；`0` 表示全部 |
 | `--backend` | `hybrid-engine` | 传给 `mineru -b` |
-| `--gpu-memory-utilization` | `0.7` | GPU 显存占用比例 `(0,1]` |
+| `--gpu-memory-utilization` | `0.3` | GPU 显存占用比例 `(0,1]`；32GB 卡建议 `0.45` |
 | `--progress-interval` | `30` | 总体进度心跳间隔（秒）；`0` 关闭 |
 
 进度会写入 `run.log`：`[progress]` 总进度条 + ETA，`[GPU n]` batch 内 `task#` / 错误摘要，`[live]` 各卡当前 batch。更细的 MinerU 原文日志：
@@ -141,6 +164,8 @@ pgrep -af '01_mineru_local_multi_gpu|mineru -p'
 ```bash
 tail -f {output}/_logs/<run-id>/gpu*_batch*.log
 ```
+
+超大文件延后清单：`{output}/_logs/<run-id>/deferred_large.txt`。
 
 ### 输出
 
@@ -156,6 +181,8 @@ tail -f {output}/_logs/<run-id>/gpu*_batch*.log
 3. 请固定 `mineru==3.4.5`，勿随意升到 4.x（接口/行为可能不兼容本脚本）。
 4. 多机并行时各分片 `--file-list` 必须互斥；索引可共享复用，`--input` 为本机论文根目录（能解析索引里的 `rel_path` 即可）。
 5. `--temp-dir` 必须可写本地盘。把临时目录放在 NAS 上容易出现 `OSError: Input/output error`，导致整批失败。
+6. 结果落到 CIFS/NAS 时脚本只拷贝文件内容（v1.3.4+），避免 `chmod` → `Operation not permitted`。
+7. 勿在未停旧任务时换分片或改参数中途重启；先 `pkill` 干净再启。
 
 ## 第二步：Markdown 生成预训练数据
 
