@@ -14,7 +14,11 @@
 
 `01_mineru_local_multi_gpu.py`（v1.5.0）把目录内 PDF 递归转为 Markdown。每张 GPU 独立跑本地 MinerU（无 Router / 无远程 API），支持断点续跑、进度条、**索引分片多机并行**。控制台日志带时间戳；索引模式默认不做逐文件 NAS `stat`，启动更快。中间临时目录默认在本地盘（`--temp-dir`，勿用 NAS）。多机共用 `--output` 时，批处理日志写在 `_logs/<run-id>/`（默认取分片文件名）。
 
-**v1.5.0**：`--order small-first` + `--max-bytes`（默认 10MiB）先做小文件、大文件延后（旧 `1103` 分片也适用）；成功后在 `--file-list` TSV 写入 `ocr_status=ok`、`ocr_finished_at`（**同一 shard 只允许一台机器写**）。仍写输出目录 `.success`，启动时可回填 TSV。
+**v1.5.2**：同卡多实例默认 `--engine-init-lock auto`，冷启 EngineCore 互斥，避免显存 profile 互踩。
+
+**v1.5.1**：喂 mineru 前跳过空/坏 PDF（`bad_pdf.txt`），避免 PdfiumError 连坐整 chunk。
+
+**v1.5.0**：`--order small-first` + `--max-bytes`；成功后回写 TSV `ocr_status`；同 shard 单写者；`.success` 可回填。
 
 索引工具：`build_pdf_index.py`（扫 PDF → 全量索引 + N 分片；可用 `--balance bytes` / `--from-index` 重切）。
 

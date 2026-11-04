@@ -11,13 +11,16 @@ No Router / no --api-url. Each GPU consumes disjoint batches.
   --batch-size 200 --mineru-chunk-size 25 --max-bytes 10485760 --order small-first
   脚本会把 ≤10MiB 先做、更大的延后；成功后在 file-list TSV 写入
   ocr_status=ok / ocr_finished_at=...（同 shard 只应一台机器写）。
+  喂给 mineru 前会探测坏/空 PDF 并跳过，避免 PdfiumError 连坐整 chunk。
+  同卡多实例默认用 --engine-init-lock，冷启 EngineCore 时互斥，避免显存 profile 互踩。
 
 索引工具见 build_pdf_index.py。
 """
-__version__ = '1.5.0'
+__version__ = '1.5.2'
 
 import argparse
 import csv
+import fcntl
 import json
 import os
 import queue
@@ -84,6 +87,70 @@ ERROR_HINT_RE = re.compile(
     r'(ValueError|CUDA out of memory|Free memory on device|Error:|Traceback)',
     re.I,
 )
+# 同卡双开：冷启完成（或失败）后再放行另一个进程的 EngineCore
+ENGINE_INIT_DONE_RE = re.compile(
+    r'(Uvicorn running on|Application startup complete|Submitting batch|'
+    r'Engine core initialization failed|EngineCore failed to start|'
+    r'Error in memory profiling)',
+    re.I,
+)
+
+
+def resolve_engine_init_lock(args: argparse.Namespace, gpu: int) -> Path | None:
+    raw = getattr(args, 'engine_init_lock', 'auto')
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if text.lower() in ('', 'none', 'off', '0', 'false'):
+        return None
+    if text.lower() == 'auto':
+        return Path(tempfile.gettempdir()) / f'mineru_engine_init_gpu{gpu}.lock'
+    return Path(text)
+
+
+class EngineInitLock:
+    """跨进程 flock：只在 EngineCore 冷启阶段互斥，稳态推理可并行。"""
+
+    def __init__(self, path: Path | None, timeout_s: float = 180.0):
+        self.path = path
+        self.timeout_s = timeout_s
+        self._fh = None
+        self._held = False
+        self._acquired_at = 0.0
+
+    def acquire(self, note: str = '') -> None:
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.path, 'a+', encoding='utf-8')
+        log(f'[info] waiting engine-init lock {self.path} {note}'.rstrip())
+        fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        self._held = True
+        self._acquired_at = time.monotonic()
+        self._fh.seek(0)
+        self._fh.truncate()
+        self._fh.write(f'pid={os.getpid()} at={datetime.now().isoformat(timespec="seconds")} {note}\n')
+        self._fh.flush()
+        log(f'[info] acquired engine-init lock {self.path}')
+
+    def release_if_needed(self, line: str = '', *, force: bool = False) -> None:
+        if not self._held:
+            return
+        timed_out = (time.monotonic() - self._acquired_at) >= self.timeout_s
+        done = force or timed_out or bool(ENGINE_INIT_DONE_RE.search(line or ''))
+        if not done:
+            return
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
+            self._held = False
+            why = 'timeout' if timed_out and not force else ('force' if force else 'ready')
+            log(f'[info] released engine-init lock ({why}) {self.path}')
 
 
 def log(msg: str = '') -> None:
@@ -243,6 +310,10 @@ def _run_mineru_chunk(
 
         return_code = 0
         proc: subprocess.Popen | None = None
+        init_lock = EngineInitLock(
+            resolve_engine_init_lock(args, gpu),
+            timeout_s=float(getattr(args, 'engine_init_lock_timeout', 180.0) or 180.0),
+        )
         try:
             with log_file.open('a', encoding='utf-8') as lf:
                 lf.write(
@@ -250,51 +321,93 @@ def _run_mineru_chunk(
                     f'command={cmd}\n'
                 )
                 lf.flush()
-                proc = subprocess.Popen(
-                    cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1, start_new_session=True,
-                )
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    lf.write(line)
-                    lf.flush()
-                    stripped = line.rstrip()
-                    task_m = TASK_RE.search(stripped)
-                    interesting = bool(
-                        task_m or SUBMIT_RE.search(stripped) or ERROR_HINT_RE.search(stripped)
+                init_lock.acquire(note=f'gpu={gpu} batch={batch_number} chunk={chunk_index}')
+                try:
+                    proc = subprocess.Popen(
+                        cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, bufsize=1, start_new_session=True,
                     )
-                    with live_lock:
-                        state = live.get(gpu, {})
-                        # 进度：已落盘 md 数（跨 chunk 累加在 results 下）
-                        md_n = count_md_stems(results)
-                        if task_m:
-                            # chunk 内 task# + 本 batch 已完成 md，作展示用
-                            state['task_seen'] = max(md_n, int(task_m.group(1)))
-                        else:
-                            state['task_seen'] = max(int(state.get('task_seen', 0)), md_n)
-                        state['md_ready'] = md_n
-                        state['last_line'] = stripped[-160:]
-                        state['started'] = batch_started
-                        state['batch'] = batch_number
-                        state['batch_total'] = batch_total
-                        state['results_dir'] = str(results)
-                        live[gpu] = state
-                    if interesting:
-                        md_n = live.get(gpu, {}).get('md_ready', 0)
-                        log(
-                            f'[GPU {gpu}] batch={batch_number:05d} '
-                            f'chunk={chunk_index} '
-                            f'{progress_bar(md_n, batch_total, width=20)} '
-                            f'| {stripped[-100:]}'
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        lf.write(line)
+                        lf.flush()
+                        stripped = line.rstrip()
+                        init_lock.release_if_needed(stripped)
+                        task_m = TASK_RE.search(stripped)
+                        interesting = bool(
+                            task_m or SUBMIT_RE.search(stripped) or ERROR_HINT_RE.search(stripped)
                         )
-                return_code = proc.wait()
+                        with live_lock:
+                            state = live.get(gpu, {})
+                            # 进度：已落盘 md 数（跨 chunk 累加在 results 下）
+                            md_n = count_md_stems(results)
+                            if task_m:
+                                # chunk 内 task# + 本 batch 已完成 md，作展示用
+                                state['task_seen'] = max(md_n, int(task_m.group(1)))
+                            else:
+                                state['task_seen'] = max(int(state.get('task_seen', 0)), md_n)
+                            state['md_ready'] = md_n
+                            state['last_line'] = stripped[-160:]
+                            state['started'] = batch_started
+                            state['batch'] = batch_number
+                            state['batch_total'] = batch_total
+                            state['results_dir'] = str(results)
+                            live[gpu] = state
+                        if interesting:
+                            md_n = live.get(gpu, {}).get('md_ready', 0)
+                            log(
+                                f'[GPU {gpu}] batch={batch_number:05d} '
+                                f'chunk={chunk_index} '
+                                f'{progress_bar(md_n, batch_total, width=20)} '
+                                f'| {stripped[-100:]}'
+                            )
+                    return_code = proc.wait()
+                finally:
+                    init_lock.release_if_needed(force=True)
         except Exception as exc:
             with log_file.open('a', encoding='utf-8') as lf:
                 lf.write(f'CHUNK EXCEPTION chunk={chunk_index}: {exc!r}\n')
             return_code = -1
+            init_lock.release_if_needed(force=True)
         finally:
             kill_process_group(proc)
         return return_code
+
+
+def probe_pdf_readable(path: Path) -> tuple[bool, str]:
+    """喂 mineru 前探测：空文件 / 非 PDF 头 / pdfium 打不开 → 跳过，避免整 chunk 连坐。"""
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return False, f'stat:{exc}'
+    if size <= 0:
+        return False, 'empty'
+    try:
+        with path.open('rb') as f:
+            head = f.read(5)
+    except OSError as exc:
+        return False, f'read:{exc}'
+    if head != b'%PDF-':
+        return False, f'bad_magic:{head!r}'
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        return True, 'ok_magic_only'
+    doc = None
+    try:
+        doc = pdfium.PdfDocument(str(path))
+        n_pages = len(doc)
+        if n_pages <= 0:
+            return False, 'zero_pages'
+        return True, 'ok'
+    except Exception as exc:
+        return False, f'pdfium:{exc}'
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
 
 
 def run_batch(gpu, number, files, src_root, output, args, log_dir, live, live_lock):
@@ -306,13 +419,18 @@ def run_batch(gpu, number, files, src_root, output, args, log_dir, live, live_lo
         results = tmp / 'results'
         results.mkdir()
         missing_now: list[Path] = []
+        bad_now: list[tuple[Path, str]] = []
         present: list[tuple[int, Path]] = []
         for i, pdf in enumerate(files):
-            # 索引模式下启动时不做 is_file；缺失文件在此失败并记入 failures
-            if pdf.is_file():
-                present.append((i, pdf))
-            else:
+            # 索引模式下启动时不做 is_file；缺失/坏文件在此失败并记入 failures
+            if not pdf.is_file():
                 missing_now.append(pdf)
+                continue
+            ok, reason = probe_pdf_readable(pdf)
+            if not ok:
+                bad_now.append((pdf, reason))
+                continue
+            present.append((i, pdf))
 
         log_file = log_dir / f'gpu{gpu}_batch{number:05d}.log'
         start = time.monotonic()
@@ -331,16 +449,31 @@ def run_batch(gpu, number, files, src_root, output, args, log_dir, live, live_lo
         log(
             f'[GPU {gpu}] START batch={number:05d} files={len(files)} '
             f'present={len(present)} missing={len(missing_now)} '
-            f'chunk-size={chunk_size} log={log_file}'
+            f'bad-pdf={len(bad_now)} chunk-size={chunk_size} log={log_file}'
         )
 
         return_code = 0
         with log_file.open('w', encoding='utf-8') as lf:
             lf.write(
                 f'GPU={gpu} count={len(files)} present={len(present)} '
-                f'missing={len(missing_now)} chunk_size={chunk_size} '
+                f'missing={len(missing_now)} bad_pdf={len(bad_now)} '
+                f'chunk_size={chunk_size} '
                 f'backend={args.backend} util={args.gpu_memory_utilization}\n'
             )
+            for pdf, reason in bad_now[:50]:
+                lf.write(f'BAD_PDF skip {reason}\t{pdf}\n')
+            if len(bad_now) > 50:
+                lf.write(f'BAD_PDF ... and {len(bad_now) - 50} more\n')
+
+        if bad_now:
+            bad_path = log_dir / 'bad_pdf.txt'
+            try:
+                with bad_path.open('a', encoding='utf-8') as bf:
+                    now = datetime.now().isoformat(timespec='seconds')
+                    for pdf, reason in bad_now:
+                        bf.write(f'{now}\tGPU{gpu}\t{reason}\t{pdf}\n')
+            except OSError as exc:
+                log(f'[warn] cannot write bad_pdf.txt: {exc!r}')
 
         if present:
             for c_i in range(0, len(present), chunk_size):
@@ -368,13 +501,13 @@ def run_batch(gpu, number, files, src_root, output, args, log_dir, live, live_lo
                         )
         else:
             with log_file.open('a', encoding='utf-8') as lf:
-                lf.write('SKIP mineru: all files missing on disk\n')
+                lf.write('SKIP mineru: all files missing or bad PDF\n')
 
         ok_pdfs: list[Path] = []
-        failures = list(missing_now)
-        missing_set = set(missing_now)
+        failures = list(missing_now) + [p for p, _ in bad_now]
+        skip_set = set(failures)
         for i, pdf in enumerate(files):
-            if pdf in missing_set:
+            if pdf in skip_set:
                 continue
             # Prefer staged unique name; fall back to raw stem (compat)
             source_dir = results / Path(_stage_name(i, pdf)).stem
@@ -677,6 +810,15 @@ def main():
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--backend', default='hybrid-engine')
     ap.add_argument('--gpu-memory-utilization', type=float, default=0.3)
+    ap.add_argument(
+        '--engine-init-lock', default='auto',
+        help='同卡多实例冷启互斥锁：auto=/tmp/mineru_engine_init_gpu{N}.lock；'
+             'none 关闭；或指定锁文件路径',
+    )
+    ap.add_argument(
+        '--engine-init-lock-timeout', type=float, default=180.0,
+        help='持有冷启锁最长时间（秒）；超时自动释放，避免死锁',
+    )
     ap.add_argument('--progress-interval', type=float, default=30.0,
                     help='总体进度心跳间隔（秒）；<=0 关闭')
     args = ap.parse_args()
@@ -688,6 +830,8 @@ def main():
         ap.error('--max-bytes >= 0 required')
     if not (0 < args.gpu_memory_utilization <= 1):
         ap.error('--gpu-memory-utilization must be in (0,1]')
+    if args.engine_init_lock_timeout <= 0:
+        ap.error('--engine-init-lock-timeout must be > 0')
     try:
         gpus = [int(s.strip()) for s in args.gpus.split(',')]
         assert gpus and len(gpus) == len(set(gpus)) and all(x >= 0 for x in gpus)
@@ -789,6 +933,12 @@ def main():
         f'GPUs: {gpus}; batch-size: {args.batch_size}; '
         f'mineru-chunk-size: {args.mineru_chunk_size}; '
         f'order: {args.order}; max-bytes: {args.max_bytes}; batches: {n_batches}'
+    )
+    sample_lock = resolve_engine_init_lock(args, gpus[0])
+    log(
+        f'[info] engine-init-lock='
+        f'{sample_lock if sample_lock is not None else "off"} '
+        f'timeout={args.engine_init_lock_timeout}s'
     )
     log('IMPORTANT: no --api-url, each GPU runs its own local MinerU engine')
     log(f'[progress] {progress_bar(skipped, total)} (already done)')
