@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | 0 | `build_pdf_index.py` | 扫 PDF → 全量索引 + N 分片（多机分配） |
 | 1 | `01_mineru_local_multi_gpu.py` | PDF 递归转为 Markdown（可按索引分片） |
+| — | `monitor_mineru_dingtalk.py` / `start_monitor_dingtalk.sh` | 可选：解析 `run_*.log` 推钉钉进度 |
 | 2 | `02_generate_dataset.py` | Markdown 整理为 JSON，再汇总为 JSONL |
 
 第一步的 `--output` 目录，就是第二步的 `--input-dir`。两个脚本使用不同的 conda 环境。
@@ -121,6 +122,31 @@ nohup python -u 01_mineru_local_multi_gpu.py \
   > /path/to/run.log 2>&1 &
 
 tail -f /path/to/run.log
+```
+
+### 钉钉进度推送（可选）
+
+解析 nohup 的 `run_*.log`（含 `[progress]` / `[live]`），定时推到钉钉自定义机器人。大日志会同时读文件头（`Found` 总数）和文件尾（最新进度）。
+
+多机：各机把日志写到 NAS 同一目录且文件名互不覆盖（如 `run_shard00.log`），**一台机器**跑监控即可；或每机各自机器人 + 各自 `--log-glob`。
+
+```bash
+# 钉钉群 → 智能群助手 → 自定义机器人：复制 Webhook；若开了「加签」再设 SECRET
+cp dingtalk.env.example dingtalk.env   # 填入真实 Webhook / SECRET（已 gitignore）
+
+# 或直接 export
+export DINGTALK_WEBHOOK='https://oapi.dingtalk.com/robot/send?access_token=xxx'
+export DINGTALK_SECRET='SECxxx'   # 未开加签可省略
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+
+# 试跑（不发送）
+python monitor_mineru_dingtalk.py --once --dry-run \
+  --log-glob '/NAS_TYSK/02Data/大模型三水论文/run_shard*.log'
+
+# 后台（默认每 30 分钟；可用 INTERVAL=1200 覆盖）
+./start_monitor_dingtalk.sh
+./start_monitor_dingtalk.sh status
+./start_monitor_dingtalk.sh stop
 ```
 
 停止：
