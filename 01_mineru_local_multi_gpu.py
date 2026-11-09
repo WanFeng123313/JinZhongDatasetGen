@@ -16,7 +16,7 @@ No Router / no --api-url. Each GPU consumes disjoint batches.
 
 索引工具见 build_pdf_index.py。
 """
-__version__ = '1.5.2'
+__version__ = '1.5.4'
 
 import argparse
 import csv
@@ -50,22 +50,43 @@ def sanitize_run_id(value: str) -> str:
     return cleaned or 'default'
 
 
-def copy_tree_data(src: Path, dst: Path) -> None:
+def _keep_output_file(rel: Path, mode: str) -> bool:
+    """Whether to persist a file under a document result dir."""
+    if mode == 'all':
+        return True
+    # md-images: only *.md and anything under images/
+    if rel.suffix.lower() == '.md':
+        return True
+    return 'images' in rel.parts
+
+
+def copy_tree_data(src: Path, dst: Path, keep: str = 'md-images') -> None:
     """Copy directory tree with file contents only (no chmod/utime/xattr).
 
     CIFS mounts with ``nounix`` often reject ``chmod`` (EPERM). ``shutil.move`` /
     ``copy2`` / default ``copytree`` then fail even after data was written.
+
+    keep:
+      - md-images（默认）：只留 ``*.md`` 与 ``images/``，丢掉 origin/layout PDF、json 等
+      - all：MinerU 原始整包
     """
     src = Path(src)
     dst = Path(dst)
     if dst.exists():
         raise FileExistsError(str(dst))
+    wrote = False
     for root, _dirs, files in os.walk(src):
-        rel = Path(root).relative_to(src)
-        target_dir = dst if rel == Path('.') else dst / rel
-        target_dir.mkdir(parents=True, exist_ok=True)
+        rel_dir = Path(root).relative_to(src)
         for name in files:
+            rel = name if rel_dir == Path('.') else rel_dir / name
+            if not _keep_output_file(Path(rel), keep):
+                continue
+            target_dir = dst if rel_dir == Path('.') else dst / rel_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(Path(root) / name, target_dir / name)
+            wrote = True
+    if not wrote:
+        raise FileNotFoundError(f'no kept files under {src} (keep={keep})')
 
 
 def resolve_run_id(args: argparse.Namespace) -> str:
@@ -530,7 +551,7 @@ def run_batch(gpu, number, files, src_root, output, args, log_dir, live, live_lo
                     backup = dest.with_name(dest.name + '.incomplete_' + str(int(time.time_ns())))
                     dest.rename(backup)
                 # NAS/CIFS: copy contents only; avoid shutil.move/copy2 chmod EPERM
-                copy_tree_data(source_dir, dest)
+                copy_tree_data(source_dir, dest, keep=getattr(args, 'keep_output', 'md-images'))
                 shutil.rmtree(source_dir, ignore_errors=True)
                 (dest / '.success').write_text(json.dumps({
                     'pdf': str(pdf.relative_to(src_root)),
@@ -821,6 +842,11 @@ def main():
     )
     ap.add_argument('--progress-interval', type=float, default=30.0,
                     help='总体进度心跳间隔（秒）；<=0 关闭')
+    ap.add_argument(
+        '--keep-output', choices=('md-images', 'all'), default='md-images',
+        help='写入 --output 时保留内容：md-images=仅 *.md+images/（默认）；'
+             'all=MinerU 整包（含 origin/layout pdf、json）',
+    )
     args = ap.parse_args()
     if args.batch_size < 1 or args.limit < 0:
         ap.error('--batch-size >= 1 and --limit >= 0 required')
@@ -839,6 +865,7 @@ def main():
         ap.error('--gpus should be unique nonnegative IDs separated by commas')
 
     log(f'[info] mineru_local_multi_gpu.py v{__version__}')
+    log(f'[info] keep-output={args.keep_output}')
     warn_orphan_mineru_services()
     if args.temp_dir is None:
         args.temp_dir = Path(tempfile.gettempdir()) / 'mineru_local_batches'
@@ -878,8 +905,9 @@ def main():
     t0 = time.monotonic()
     done_keys = completed_dest_keys(output)
     pending_sized: list[tuple[Path, int]] = []
-    skip_tsv = 0
+    skip_both = 0
     skip_success = 0
+    stale_tsv = 0
     backfill_rels: list[str] = []
     for p, b in sized:
         try:
@@ -888,23 +916,27 @@ def main():
             rel = ''
         tsv_ok = bool(ledger and rel and ledger.is_ok(rel))
         disk_ok = dest_key(p, src_root) in done_keys
-        if tsv_ok:
-            skip_tsv += 1
-            continue
+        # 只认当前 --output 下的 .success；TSV ok 单独不够（换 OUT 后可能无产物）
         if disk_ok:
-            skip_success += 1
-            if ledger is not None and rel:
-                backfill_rels.append(rel)
+            if tsv_ok:
+                skip_both += 1
+            else:
+                skip_success += 1
+                if ledger is not None and rel:
+                    backfill_rels.append(rel)
             continue
+        if tsv_ok:
+            stale_tsv += 1
         pending_sized.append((p, b))
     if ledger is not None and backfill_rels:
         n_bf = ledger.mark_ok_many(backfill_rels)
         if n_bf:
             ledger.flush()
             log(f'[info] backfilled {n_bf} {OCR_STATUS_COL}=ok from existing .success')
-    skipped = skip_tsv + skip_success
+    skipped = skip_both + skip_success
     log(
-        f'[info] skip tsv_ok={skip_tsv} .success={skip_success} '
+        f'[info] skip both={skip_both} .success_only={skip_success} '
+        f'stale_tsv_ok_no_success={stale_tsv} '
         f'completed_markers={len(done_keys)} pending={len(pending_sized)} '
         f'in {fmt_duration(time.monotonic() - t0)}'
     )

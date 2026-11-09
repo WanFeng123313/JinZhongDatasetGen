@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | 0 | `build_pdf_index.py` | 扫 PDF → 全量索引 + N 分片（多机分配） |
 | 1 | `01_mineru_local_multi_gpu.py` | PDF 递归转为 Markdown（可按索引分片） |
+| — | `clean_md_output.py` | 可选：清理历史整包输出，保留 md/images/`.success` |
 | — | `monitor_mineru_dingtalk.py` / `start_monitor_dingtalk.sh` | 可选：解析 `run_*.log` 推钉钉进度 |
 | 2 | `02_generate_dataset.py` | Markdown 整理为 JSON，再汇总为 JSONL |
 
@@ -13,7 +14,11 @@
 
 ## 第一步：PDF 转 Markdown
 
-`01_mineru_local_multi_gpu.py`（v1.5.0）把目录内 PDF 递归转为 Markdown。每张 GPU 独立跑本地 MinerU（无 Router / 无远程 API），支持断点续跑、进度条、**索引分片多机并行**。控制台日志带时间戳；索引模式默认不做逐文件 NAS `stat`，启动更快。中间临时目录默认在本地盘（`--temp-dir`，勿用 NAS）。多机共用 `--output` 时，批处理日志写在 `_logs/<run-id>/`（默认取分片文件名）。
+`01_mineru_local_multi_gpu.py`（v1.5.4）把目录内 PDF 递归转为 Markdown。每张 GPU 独立跑本地 MinerU（无 Router / 无远程 API），支持断点续跑、进度条、**索引分片多机并行**。控制台日志带时间戳；索引模式默认不做逐文件 NAS `stat`，启动更快。中间临时目录默认在本地盘（`--temp-dir`，勿用 NAS）。多机共用 `--output` 时，批处理日志写在 `_logs/<run-id>/`（默认取分片文件名）。
+
+**v1.5.4**：跳过逻辑以**当前 `--output` 下的 `.success`** 为准；仅 TSV `ocr_status=ok` 但磁盘无 `.success` 会重做（`stale_tsv_ok_no_success`），避免换 OUT 后空跳过。
+
+**v1.5.3**：默认 `--keep-output md-images`，落盘只留 `*.md` + `images/`；需要整包时加 `--keep-output all`。可用 `clean_md_output.py` 清理历史整包输出。
 
 **v1.5.2**：同卡多实例默认 `--engine-init-lock auto`，冷启 EngineCore 互斥，避免显存 profile 互踩。
 
@@ -167,7 +172,7 @@ pkill -f mineru.cli.fast_api
 pgrep -af '01_mineru_local_multi_gpu|mineru -p|mineru.cli.fast_api'
 ```
 
-已写出 `.success` 的结果会保留，重跑会自动跳过。
+当前 `--output` 下已有 `.success` 的结果会保留，重跑会自动跳过；仅 TSV 已 `ok` 但 OUT 无 `.success` 不会跳过。
 
 ### 参数
 
@@ -183,6 +188,7 @@ pgrep -af '01_mineru_local_multi_gpu|mineru -p|mineru.cli.fast_api'
 | `--mineru-chunk-size` | `25` | 单次 mineru CLI 篇数；隔离 EngineCore 挂掉连坐 |
 | `--max-bytes` | `10485760` | 大于该体积延后到队尾；`0` 关闭 |
 | `--order` | `small-first` | `as-is` / `small-first` / `large-first` |
+| `--keep-output` | `md-images` | `md-images`=只留 md+images；`all`=MinerU 整包 |
 | （file-list 回写） | — | 成功后写 `ocr_status=ok`、`ocr_finished_at`；每批 flush |
 | `--limit` | `0` | `>0` 时只处理前 N 个；`0` 表示全部 |
 | `--backend` | `hybrid-engine` | 传给 `mineru -b` |
@@ -199,8 +205,8 @@ tail -f {output}/_logs/<run-id>/gpu*_batch*.log
 
 ### 输出
 
-- 每个 PDF → `{output}/{相对路径}/{stem}/`，内含 `.md` 与 `.success` 标记
-- 已有 `.success` 且存在非空 `.md` → 跳过（可安全重跑）
+- 每个 PDF → `{output}/{相对路径}/{stem}/`，默认内含 `*.md`、`images/` 与 `.success` 标记
+- 当前 OUT 已有 `.success` → 跳过（可安全重跑）；TSV `ok` 仅作账本/回填，不足以单独跳过
 - 日志目录：`{output}/_logs/<run-id>/`（默认 `shard_XX` 或主机名）
 - 批日志：`gpu{N}_batchXXXXX.log`；失败列表：`failed_local.txt`（追加写入）
 
