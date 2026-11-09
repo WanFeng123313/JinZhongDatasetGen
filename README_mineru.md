@@ -1,4 +1,4 @@
-# MinerU 多 GPU 本地批处理（v1.5.4）
+# MinerU 多 GPU 本地批处理（v1.5.5）
 
 将目录内 PDF 递归转为 Markdown。每张 GPU 独立跑本地 MinerU（无 Router / 无远程 API），支持断点续跑、进度条、**索引分片多机并行**。控制台日志带时间戳；索引模式默认不做逐文件 NAS `stat`，启动更快。**中间临时目录默认在本地盘**（`--temp-dir`，勿用 NAS），避免 CIFS `Input/output error`。多机共用 `--output` 时，批处理日志写在 `_logs/<run-id>/`（默认取分片文件名）。
 
@@ -6,6 +6,8 @@
 - 索引：`build_pdf_index.py`（扫 PDF → 全量索引 + N 分片；供 MinerU / 后续预训练共用）
 - 清理：`clean_md_output.py`（可选；清理历史整包，保留 md/images/`.success`）
 - 本机对齐版本：`mineru==3.4.5`（conda 环境约 8.4G；参考依赖 `torch==2.11.0` / `vllm==0.20.2`）
+
+**v1.5.5**：默认 `--order size-balanced`（按体积排序后 round-robin 分批，每批体量接近），避免 `small-first` 越往后越慢。
 
 **v1.5.4**：跳过逻辑以**当前 `--output` 下的 `.success`** 为准；仅 TSV `ocr_status=ok` 但磁盘无 `.success` 会重做（`stale_tsv_ok_no_success`），避免换 OUT 后空跳过。
 
@@ -74,17 +76,17 @@ python build_pdf_index.py \
 各机跑任务时：`--input` 填**本机上的论文根目录**（同一套数据，挂载路径可以不同），`--file-list` 指向分到的那份 `shard_XX.tsv`。
 
 ```bash
-# 可用 1103 或 1104；1103 队首虽是巨本，脚本仍会先做 ≤10MiB
 # 成功后会改写该 shard TSV（追加 ocr_status / ocr_finished_at），每机独占自己的 shard
+# 默认 size-balanced；也可显式写出
 nohup python -u mineru_local_multi_gpu.py \
   --input /NAS_TYSK/02Data/大模型三水论文/20261102提供 \
   --file-list /NAS_TYSK/02Data/大模型三水论文/20261102提供/pdf_index_1103/shard_01.tsv \
   --output /NAS_TYSK/02Data/大模型三水论文/sanshui_MD_1104 \
   --gpus 1 \
-  --batch-size 1000 \
-  --mineru-chunk-size 1000 \
+  --batch-size 500 \
+  --mineru-chunk-size 500 \
   --max-bytes 0 \
-  --order large-first \
+  --order size-balanced \
   --gpu-memory-utilization 0.2 \
   > /NAS_TYSK/02Data/大模型三水论文/run_shard01.log 2>&1 &
 
@@ -155,8 +157,8 @@ pgrep -af 'mineru_local_multi_gpu|mineru -p'
 | `--gpus` | `1,2` | GPU ID，逗号分隔、不可重复 |
 | `--batch-size` | `200` | 调度/记账粒度（失败列表、落盘批次） |
 | `--mineru-chunk-size` | `25` | **单次 mineru CLI 篇数**；隔离 EngineCore 挂掉后的连坐 |
-| `--max-bytes` | `10485760` | 大于该体积的 PDF 延后到队尾；`0` 关闭（与索引片内 small-first 叠加更稳） |
-| `--order` | `small-first` | `as-is` / `small-first` / `large-first`；即使用 1103 也会运行时重排 |
+| `--max-bytes` | `10485760` | 大于该体积的 PDF 延后到队尾；`0` 关闭 |
+| `--order` | `size-balanced` | `size-balanced` / `small-first` / `large-first` / `as-is`；推荐 size-balanced |
 | `--keep-output` | `md-images` | `md-images`=只留 md+images；`all`=MinerU 整包 |
 | （自动） | — | 成功后回写 file-list：`ocr_status=ok`、`ocr_finished_at`；同 shard 单写者 |
 | `--limit` | `0` | `>0` 时只处理前 N 个；`0` 表示全部 |

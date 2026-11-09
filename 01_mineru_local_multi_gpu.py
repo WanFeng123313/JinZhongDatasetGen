@@ -8,15 +8,16 @@ No Router / no --api-url. Each GPU consumes disjoint batches.
   2) --input <数据集根> + --file-list <索引/分片.tsv>（多机按索引分配）
 
 海量论文（含 pdf_index_1103 大文件在前的分片）建议：
-  --batch-size 200 --mineru-chunk-size 25 --max-bytes 10485760 --order small-first
-  脚本会把 ≤10MiB 先做、更大的延后；成功后在 file-list TSV 写入
+  --batch-size 500 --mineru-chunk-size 500 --max-bytes 0 --order size-balanced
+  size-balanced：按体积排序后 round-robin 分到各批，每批体量接近，避免 small-first 越往后越吃力。
+  也可用 small-first + --max-bytes 把巨本延后；成功后在 file-list TSV 写入
   ocr_status=ok / ocr_finished_at=...（同 shard 只应一台机器写）。
   喂给 mineru 前会探测坏/空 PDF 并跳过，避免 PdfiumError 连坐整 chunk。
   同卡多实例默认用 --engine-init-lock，冷启 EngineCore 时互斥，避免显存 profile 互踩。
 
 索引工具见 build_pdf_index.py。
 """
-__version__ = '1.5.4'
+__version__ = '1.5.5'
 
 import argparse
 import csv
@@ -770,30 +771,63 @@ def collect_pdfs(
     return src_root, sized, ledger
 
 
+def _size_balanced(items: list[tuple[Path, int]], batch_size: int) -> list[tuple[Path, int]]:
+    """按体积升序后 round-robin 分到各批，使每批体积分布接近。
+
+    例：batch_size=500、共 N 批时，第 i 篇进第 (i % N) 批；展平后按批切开。
+    """
+    if not items:
+        return []
+    ranked = sorted(items, key=lambda x: (x[1], str(x[0])))
+    bs = max(1, int(batch_size))
+    n_batches = (len(ranked) + bs - 1) // bs
+    if n_batches <= 1:
+        return ranked
+    buckets: list[list[tuple[Path, int]]] = [[] for _ in range(n_batches)]
+    for i, item in enumerate(ranked):
+        buckets[i % n_batches].append(item)
+    out: list[tuple[Path, int]] = []
+    for bucket in buckets:
+        out.extend(bucket)
+    return out
+
+
 def order_and_defer(
     pending: list[tuple[Path, int]],
     *,
     order: str,
     max_bytes: int,
+    batch_size: int = 200,
 ) -> tuple[list[Path], list[tuple[Path, int]]]:
-    """按体积排序；超大文件挪到队尾（仍会处理，只是延后）。
+    """按体积/策略排序；超大文件挪到队尾（仍会处理，只是延后）。
 
     返回 (ordered_paths, deferred_entries)。
     """
     items = list(pending)
-    if order == 'small-first':
-        items.sort(key=lambda x: (x[1], str(x[0])))
-    elif order == 'large-first':
-        items.sort(key=lambda x: (-x[1], str(x[0])))
-    # order == 'as-is': keep index/scan order
+
+    def _apply_order(rows: list[tuple[Path, int]]) -> list[tuple[Path, int]]:
+        if order == 'size-balanced':
+            return _size_balanced(rows, batch_size)
+        if order == 'small-first':
+            return sorted(rows, key=lambda x: (x[1], str(x[0])))
+        if order == 'large-first':
+            return sorted(rows, key=lambda x: (-x[1], str(x[0])))
+        # order == 'as-is': keep index/scan order
+        return rows
 
     if max_bytes <= 0:
-        return [p for p, _ in items], []
+        ordered = _apply_order(items)
+        return [p for p, _ in ordered], []
 
     primary = [(p, b) for p, b in items if b <= max_bytes]
     deferred = [(p, b) for p, b in items if b > max_bytes]
-    # 延后段内部同样按 order（small-first 时先啃「中等偏大」）
-    return [p for p, _ in primary] + [p for p, _ in deferred], deferred
+    # 主段与延后段各自按 order 排布，延后整段仍在队尾
+    ordered_primary = _apply_order(primary)
+    ordered_deferred = _apply_order(deferred)
+    return (
+        [p for p, _ in ordered_primary] + [p for p, _ in ordered_deferred],
+        ordered_deferred,
+    )
 
 
 def main():
@@ -825,8 +859,11 @@ def main():
         help='大于该字节的 PDF 延后到队尾（0=关闭）；默认 10MiB，避免巨本拖垮小文件吞吐',
     )
     ap.add_argument(
-        '--order', choices=('as-is', 'small-first', 'large-first'), default='small-first',
-        help='处理顺序；海量英文论文建议 small-first（先吃小文件抬吞吐）',
+        '--order',
+        choices=('as-is', 'small-first', 'large-first', 'size-balanced'),
+        default='size-balanced',
+        help='处理顺序：size-balanced=按体积 round-robin 分批（每批体量接近，推荐）；'
+             'small-first=先小后大（后期会变慢）；large-first / as-is',
     )
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--backend', default='hybrid-engine')
@@ -942,7 +979,10 @@ def main():
     )
 
     pending, deferred = order_and_defer(
-        pending_sized, order=args.order, max_bytes=args.max_bytes,
+        pending_sized,
+        order=args.order,
+        max_bytes=args.max_bytes,
+        batch_size=args.batch_size,
     )
     if deferred:
         deferred_path = log_dir / 'deferred_large.txt'
@@ -966,6 +1006,21 @@ def main():
         f'mineru-chunk-size: {args.mineru_chunk_size}; '
         f'order: {args.order}; max-bytes: {args.max_bytes}; batches: {n_batches}'
     )
+    if pending and args.order == 'size-balanced' and n_batches >= 2:
+        # pending 已按批展平；用原 pending_sized 的字节表估各批合计体积
+        size_map = {p: b for p, b in pending_sized}
+        batch_totals = []
+        for i in range(0, len(pending), args.batch_size):
+            chunk = pending[i:i + args.batch_size]
+            batch_totals.append(sum(size_map.get(p, 0) for p in chunk))
+        lo, hi = min(batch_totals), max(batch_totals)
+        avg = sum(batch_totals) / len(batch_totals)
+        log(
+            f'[info] size-balanced batch-bytes: '
+            f'min={lo / 1e6:.1f}MB avg={avg / 1e6:.1f}MB max={hi / 1e6:.1f}MB '
+            f'first={batch_totals[0] / 1e6:.1f}MB last={batch_totals[-1] / 1e6:.1f}MB '
+            f'n={len(batch_totals)}'
+        )
     sample_lock = resolve_engine_init_lock(args, gpus[0])
     log(
         f'[info] engine-init-lock='

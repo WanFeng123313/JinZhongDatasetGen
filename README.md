@@ -14,7 +14,9 @@
 
 ## 第一步：PDF 转 Markdown
 
-`01_mineru_local_multi_gpu.py`（v1.5.4）把目录内 PDF 递归转为 Markdown。每张 GPU 独立跑本地 MinerU（无 Router / 无远程 API），支持断点续跑、进度条、**索引分片多机并行**。控制台日志带时间戳；索引模式默认不做逐文件 NAS `stat`，启动更快。中间临时目录默认在本地盘（`--temp-dir`，勿用 NAS）。多机共用 `--output` 时，批处理日志写在 `_logs/<run-id>/`（默认取分片文件名）。
+`01_mineru_local_multi_gpu.py`（v1.5.5）把目录内 PDF 递归转为 Markdown。每张 GPU 独立跑本地 MinerU（无 Router / 无远程 API），支持断点续跑、进度条、**索引分片多机并行**。控制台日志带时间戳；索引模式默认不做逐文件 NAS `stat`，启动更快。中间临时目录默认在本地盘（`--temp-dir`，勿用 NAS）。多机共用 `--output` 时，批处理日志写在 `_logs/<run-id>/`（默认取分片文件名）。
+
+**v1.5.5**：默认 `--order size-balanced`（按体积 round-robin 分批，每批体量接近），避免 `small-first` 越往后越慢。
 
 **v1.5.4**：跳过逻辑以**当前 `--output` 下的 `.success`** 为准；仅 TSV `ocr_status=ok` 但磁盘无 `.success` 会重做（`stale_tsv_ok_no_success`），避免换 OUT 后空跳过。
 
@@ -90,10 +92,10 @@ nohup python -u 01_mineru_local_multi_gpu.py \
   --file-list /path/to/pdf_index/shard_00.tsv \
   --output /path/to/md_out \
   --gpus 1,2 \
-  --batch-size 200 \
-  --mineru-chunk-size 25 \
-  --max-bytes 10485760 \
-  --order small-first \
+  --batch-size 500 \
+  --mineru-chunk-size 500 \
+  --max-bytes 0 \
+  --order size-balanced \
   --gpu-memory-utilization 0.45 \
   > /path/to/md_out/run_shard00.log 2>&1 &
 
@@ -187,7 +189,7 @@ pgrep -af '01_mineru_local_multi_gpu|mineru -p|mineru.cli.fast_api'
 | `--batch-size` | `200` | 调度/记账粒度 |
 | `--mineru-chunk-size` | `25` | 单次 mineru CLI 篇数；隔离 EngineCore 挂掉连坐 |
 | `--max-bytes` | `10485760` | 大于该体积延后到队尾；`0` 关闭 |
-| `--order` | `small-first` | `as-is` / `small-first` / `large-first` |
+| `--order` | `size-balanced` | `size-balanced` / `small-first` / `large-first` / `as-is` |
 | `--keep-output` | `md-images` | `md-images`=只留 md+images；`all`=MinerU 整包 |
 | （file-list 回写） | — | 成功后写 `ocr_status=ok`、`ocr_finished_at`；每批 flush |
 | `--limit` | `0` | `>0` 时只处理前 N 个；`0` 表示全部 |
