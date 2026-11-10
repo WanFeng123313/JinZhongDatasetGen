@@ -5,6 +5,7 @@
 | 顺序 | 脚本 | 作用 |
 | --- | --- | --- |
 | 0 | `build_pdf_index.py` | 扫 PDF → 全量索引 + N 分片（多机分配） |
+| — | `copy_from_index.py` | 可选：按分片 TSV 拷 PDF，保持原始相对目录 |
 | 1 | `01_mineru_local_multi_gpu.py` | PDF 递归转为 Markdown（可按索引分片） |
 | — | `clean_md_output.py` | 可选：清理历史整包输出，保留 md/images/`.success` |
 | — | `monitor_mineru_dingtalk.py` / `start_monitor_dingtalk.sh` | 可选：解析 `run_*.log` 推钉钉进度 |
@@ -83,7 +84,31 @@ python build_pdf_index.py \
 `bytes` 均分时分配算法内部是大文件优先入桶，**若不做片内重排，队首会全是巨本**。
 
 **索引只需在一台机器上建好**，拷到共享盘或各机复用即可。  
-各机跑任务时：`--input` 填**本机上的论文根目录**（同一套数据，挂载路径可以不同），`--file-list` 指向分到的那份 `shard_XX.tsv`。
+需要把某个/某些分片的 PDF 落到本机盘（或另一台机器目录）时，用 `copy_from_index.py`：按 TSV 的 `rel_path` 拷贝，**目标目录结构与论文根一致**；已存在且同大小则 skip；多线程 + `.partial` 再 replace（NAS/CIFS 友好）。
+
+```bash
+SRC=/path/to/pdf_root
+DEST=/path/to/local_pdf_root
+IDX=/path/to/pdf_index
+LOG=/path/to/_copy_logs
+mkdir -p "$LOG"
+
+nohup python -u copy_from_index.py \
+  --input "$SRC" \
+  --output "$DEST" \
+  --file-list "$IDX"/shard_00.tsv "$IDX"/shard_01.tsv \
+  --workers 16 \
+  --log-dir "$LOG" \
+  --copy-index-to pdf_index \
+  > "$LOG/copy_from_index.log" 2> "$LOG/copy_from_index.err" &
+
+echo "PID=$!"
+tail -f "$LOG/copy_from_index.progress"
+```
+
+`--copy-index-to` 可选：把本次用到的 TSV 也拷到 `{output}/<子目录>/`。`--dry-run` 只估篇数/体积。
+
+各机跑 OCR 时：`--input` 填**本机上的论文根目录**（同一套数据，挂载路径可以不同），`--file-list` 指向分到的那份 `shard_XX.tsv`。
 
 ```bash
 # 多机：shard_00 …；先停旧进程再换 v1.4.0 参数

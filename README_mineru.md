@@ -2,8 +2,9 @@
 
 将目录内 PDF 递归转为 Markdown。每张 GPU 独立跑本地 MinerU（无 Router / 无远程 API），支持断点续跑、进度条、**索引分片多机并行**。控制台日志带时间戳；索引模式默认不做逐文件 NAS `stat`，启动更快。**中间临时目录默认在本地盘**（`--temp-dir`，勿用 NAS），避免 CIFS `Input/output error`。多机共用 `--output` 时，批处理日志写在 `_logs/<run-id>/`（默认取分片文件名）。
 
-- 脚本：`mineru_local_multi_gpu.py`
+- 脚本：`01_mineru_local_multi_gpu.py`（与仓库根命名一致；上游亦称 `mineru_local_multi_gpu.py`）
 - 索引：`build_pdf_index.py`（扫 PDF → 全量索引 + N 分片；供 MinerU / 后续预训练共用）
+- 拷贝：`copy_from_index.py`（按分片 TSV 拷 PDF，保持原始相对目录）
 - 清理：`clean_md_output.py`（可选；清理历史整包，保留 md/images/`.success`）
 - 本机对齐版本：`mineru==3.4.5`（conda 环境约 8.4G；参考依赖 `torch==2.11.0` / `vllm==0.20.2`）
 
@@ -73,12 +74,33 @@ python build_pdf_index.py \
 `bytes` 均分时分配算法内部是大文件优先入桶，**若不做片内重排，队首会全是巨本**——这是 1103 看起来变慢的主因之一。
 
 **索引只需在一台机器上建好**，拷到共享盘或各机复用即可。  
+需要把某个/某些分片 PDF 落到本机盘时，用 `copy_from_index.py`（按 `rel_path` 保持目录结构；同大小 skip；多线程 + `.partial`）：
+
+```bash
+SRC=/path/to/pdf_root
+DEST=/path/to/local_pdf_root
+IDX=/path/to/pdf_index
+LOG=/path/to/_copy_logs
+mkdir -p "$LOG"
+
+nohup python -u copy_from_index.py \
+  --input "$SRC" \
+  --output "$DEST" \
+  --file-list "$IDX"/shard_00.tsv "$IDX"/shard_01.tsv \
+  --workers 16 \
+  --log-dir "$LOG" \
+  --copy-index-to pdf_index \
+  > "$LOG/copy_from_index.log" 2> "$LOG/copy_from_index.err" &
+
+tail -f "$LOG/copy_from_index.progress"
+```
+
 各机跑任务时：`--input` 填**本机上的论文根目录**（同一套数据，挂载路径可以不同），`--file-list` 指向分到的那份 `shard_XX.tsv`。
 
 ```bash
 # 成功后会改写该 shard TSV（追加 ocr_status / ocr_finished_at），每机独占自己的 shard
 # 默认 size-balanced；也可显式写出
-nohup python -u mineru_local_multi_gpu.py \
+nohup python -u 01_mineru_local_multi_gpu.py \
   --input /NAS_TYSK/02Data/大模型三水论文/20261102提供 \
   --file-list /NAS_TYSK/02Data/大模型三水论文/20261102提供/pdf_index_1103/shard_01.tsv \
   --output /NAS_TYSK/02Data/大模型三水论文/sanshui_MD_1104 \
